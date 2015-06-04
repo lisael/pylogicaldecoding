@@ -1,0 +1,9 @@
+recursive-include logicaldecoding *.c *.h *.manifest
+recursive-include lib *.py
+recursive-include tests *.py
+recursive-include examples *.py 
+recursive-include doc
+recursive-include doc Makefile requirements.txt
+recursive-include doc/src *.rst *.py *.css Makefile
+include AUTHORS README.rst INSTALL LICENSE NEWS
+include PKG-INFO MANIFEST.in MANIFEST setup.py setup.cfg Makefile
