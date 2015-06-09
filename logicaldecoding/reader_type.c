@@ -122,7 +122,7 @@ reader_start(readerObject *self)
              *pValue = NULL,
              *result = NULL;
 
-    char *replication_slot = "test";
+    char *replication_slot = "test_slot";
     char **options=NULL;
     int standby_message_timeout = 10 * 1000;
 
@@ -644,8 +644,11 @@ GetConnectionFromPyMap(PyObject *conn_map, bool replication)
         if (PQconnectionNeedsPassword(tmpconn))
             PyErr_SetString(PyExc_ValueError, "password needed");
         else
-            PyErr_SetString(PyExc_IOError,
-                "could not connect to server\n");
+            /*PyErr_SetString(PyExc_IOError,*/
+                /*"could not connect to server\n");*/
+            PyErr_Format(PyExc_IOError,
+                "Could not connect to server: %s\n",
+                PQerrorMessage(tmpconn));
         goto error;
     }
 
