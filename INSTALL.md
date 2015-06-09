@@ -1,20 +1,20 @@
-__Sorry, no pypi package at the moment...
+Sorry, no pypi package at the moment...
 
 Tested only on Debian Jessie and Ubuntu Trusty (should work on any version
 of these distribs, and many more UNIXes-like systems).
 
 # packages
 
-- postgresql >= 9.4 (on the master)
+- postgresql >= 9.4 (on the origin DB)
 - libpq5-dev (on the comsumer)
 
-please use pg provided packages (TODO: URL)
+Please use pg provided packages (TODO: URL)
 
 # pylogicaldecoding
 
 Clone the repository and create and new Python2.7 virtualenv.
 
-```
+```sh
 cd pylogicaldecoding
 make install
 ```
@@ -23,7 +23,7 @@ make install
 
 ## PG configuration
 
-```
+```sh
 sudo vi /etc/postgresql/9.4/main/postgresql.conf
 # change max_replication_slots to > 0
 # change wal_level to logical
@@ -43,7 +43,7 @@ you may have to compile and install it by hand.
 If you're lucky this may be enough ("test_slot" is mandatory, it's hard coded
 in the C code at the moment TODO).
 
-```
+```sql
 sudo -u postgres psql
 postgres=# SELECT * FROM pg_create_logical_replication_slot('test_slot', 'test_decoding');
  slot_name | xlog_position 
@@ -56,7 +56,10 @@ if you get something like
 
 `ERROR:  could not access file "test_decoding": No such file or directory`
 
-Your distrib did not compile the test decoder. 
+Your distrib did not compile the test decoder.
+
+Otherwise, the installation is completed :) You can start playing with
+pylogicaldecoding (Check `README.md` and `/examples` )
 
 # install postgres’ `test_decoding.so` contrib
 
