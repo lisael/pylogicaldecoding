@@ -27,10 +27,12 @@ make install
 sudo vi /etc/postgresql/9.4/main/postgresql.conf
 # change max_replication_slots to > 0
 # change wal_level to logical
-# change max___wal_senders to > 0
+# change max_wal_senders to > 0
+
 sudo vi /etc/postgresql/9.4/main/pg_hba.conf
 # uncomment or create the line 
 # local   replication     postgres    peer
+
 sudo /etc/init.d/postgresql restart
 ```
 
@@ -40,8 +42,7 @@ Of course you can write your own decoder... however, for testing purpose, you
 can use the one provided by postgresql. Unfortunatly it may not be packaged yet,
 you may have to compile and install it by hand.
 
-If you're lucky this may be enough ("test_slot" is mandatory, it's hard coded
-in the C code at the moment TODO).
+If you're lucky this may be enough.
 
 ```sql
 sudo -u postgres psql
@@ -52,7 +53,7 @@ postgres=# SELECT * FROM pg_create_logical_replication_slot('test_slot', 'test_d
 (1 row)
 ```
 
-if you get something like
+If you get something like :
 
 `ERROR:  could not access file "test_decoding": No such file or directory`
 

@@ -1,5 +1,6 @@
 # pylogicaldecoding
-Python interface to PostgreSQL logical decoding
+Python interface to PostgreSQL [logical decoding](
+http://www.postgresql.org/docs/9.4/static/logicaldecoding.html)
 
 *Status : Very early proof of concept. Beware.*
 
@@ -80,7 +81,7 @@ of test_decoding (it can be changed passing options when the slot is created
 and soon in pylogicaldecoding itself)
 
 You may also need to know the values of updated and deleted fields. Postgres
-does that, at the expense of larger wall files and a little overhead. However
+does that, at the expense of larger WAL files and a little overhead. However
 these issues are mitigated by postgres using per table settings:
 
 ```
@@ -212,7 +213,8 @@ no way to re-read missed events.
 
 Once again, be careful, it's the killer feature but it can bite you. As soon
 as the slot is created, the origin DB keep all unacknowledged WAL on disk.
-If your consumer is dead, stuck or if you forget to call `commit()`
+If your consumer is dead, stuck or if you forget to call `commit()` you run into
+big troubles.
 
 # Play, fork, hack, PR, and have fun
 Pylogicaldecoding is in its very early stage and there is many improvements
