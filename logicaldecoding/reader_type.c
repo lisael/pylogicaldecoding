@@ -7,16 +7,20 @@ static volatile sig_atomic_t global_abort = false;
 
 typedef struct readerObject{
     PyObject_HEAD
-    PyObject *conn_params;
+    char *host;
+    char *port;
+    char *username;
+    char *dbname;
+    char *password;
     char *progname;
+    char *decoder;
+    char *slot;
     PGconn *conn;
     bool abort;
     XLogRecPtr decoded_lsn; // log level successfully sent to user's callback
     XLogRecPtr commited_lsn; // acked log level
 } readerObject;
 
-PGconn *
-GetConnectionFromPyMap(PyObject *conn_map, bool replication);
 static bool
 reader_sendFeedback(readerObject *self, int64_t now, bool force, bool replyRequested);
 
@@ -72,34 +76,186 @@ static PyObject *
 reader_repr(readerObject *self)
 {
     return PyString_FromFormat(
-        "<Reader object at %p>",self);
+        "<Reader object at %p, slot=`%s`>", self, self->slot);
 }
 
 static void
 reader_dealloc(PyObject* obj)
 {
+    readerObject *self = (readerObject *)obj;
+
+    if (self->conn)
+        PQfinish(self->conn);
+
+    // TODO: these come from PyParseArgs. Not sure if free is
+    // perfectly safe
+    {
+        free(self->host);
+        free(self->port);
+        free(self->username);
+        free(self->dbname);
+        free(self->password);
+        free(self->progname);
+        free(self->decoder);
+        free(self->slot);
+    }
+
     Py_TYPE(obj)->tp_free(obj);
 }
 
 static int
-reader_init(PyObject *obj, PyObject *args, PyObject *kwds)
+reader_connect(readerObject *self)
+{
+    int			argcount = 7;	/* dbname, replication, fallback_app_name,
+                                 * host, user, port, password */
+    int			i;
+    const char **keywords;
+    const char **values;
+    const char *tmpparam;
+
+    /* load map */
+    i = 0;
+
+    {
+        keywords = pg_malloc0((argcount + 1) * sizeof(*keywords));
+        values = pg_malloc0((argcount + 1) * sizeof(*values));
+    }
+
+    keywords[i] = "dbname";
+    values[i] = self->dbname == NULL ? "replication" : self->dbname;
+    i++;
+
+    keywords[i] = "replication";
+    values[i] = self->dbname == NULL ? "true" : "database";
+    i++;
+
+    if (self->progname)
+    {
+        keywords[i] = "fallback_application_name";
+        values[i] = self->progname;
+        i++;
+    }
+
+    if (self->host)
+    {
+        keywords[i] = "host";
+        values[i] = self->host;
+        i++;
+    }
+
+    if (self->username)
+    {
+        keywords[i] = "user";
+        values[i] = self->username;
+        i++;
+    }
+
+    if (self->port)
+    {
+        keywords[i] = "port";
+        values[i] = self->port;
+        i++;
+    }
+
+    if (self->password)
+    {
+        keywords[i] = "password";
+        values[i] = self->password;
+        i++;
+    }
+
+    self->conn = PQconnectdbParams(keywords, values, true);
+
+    if (!self->conn)
+    {
+        PyErr_NoMemory();
+        goto error;
+    }
+
+    if (PQstatus(self->conn) == CONNECTION_BAD)
+    {
+        if (PQconnectionNeedsPassword(self->conn))
+        {
+            PyErr_SetString(PyExc_ValueError, "password needed");
+            goto error;
+        }
+    }
+
+    if (PQstatus(self->conn) != CONNECTION_OK)
+    {
+        PyErr_Format(PyExc_IOError,
+            "Could not connect to server: %s\n",
+             PQerrorMessage(self->conn));
+        goto error;
+    }
+
+    /* Connection ok! */
+    free(values);
+    free(keywords);
+
+    /*
+     * Ensure we have the same value of integer timestamps as the server we
+     * are connecting to.
+     */
+    tmpparam = PQparameterStatus(self->conn, "integer_datetimes");
+    if (!tmpparam)
+    {
+        PyErr_SetString(PyExc_ValueError,
+                "Could not determine server setting for integer_datetimes");
+        goto error;
+    }
+
+// TODO: check why pg_basebackup does check this precompiler stuff
+//#ifdef HAVE_INT64_TIMESTAMP
+    if (strcmp(tmpparam, "on") != 0)
+//#else
+//        if (strcmp(tmpparam, "off") != 0)
+//#endif
+        {
+            PyErr_SetString(PyExc_ValueError,
+                    "Integer_datetimes compile flag does not match server");
+            goto error;
+        }
+
+    return 1;
+error:
+    free(values);
+    free(keywords);
+    if (self->conn)
+        PQfinish(self->conn);
+    return 0;
+}
+
+static int
+reader_init(PyObject *obj, PyObject *args, PyObject *kwargs)
 {
     readerObject *self = (readerObject *)obj;
+    static char *kwlist[] = {
+        "host", "port", "username", "dbname", "password",
+        "progname", "decoder", "slot", NULL};
+
+    self->host=self->port=self->username=self->password = NULL;
+    self->dbname = "postgres";
+    self->progname = "pylogicaldecoding";
+    self->decoder = "test_decoding";
+    self->slot = "test_slot";
 
     // TODO: not sure where we should register the signal
     // maybe we should expose a function here called at module init.
     signal(SIGINT, sigint_handler);
 
-    if (!PyArg_ParseTuple(args, "O", &self->conn_params))
+    if (!PyArg_ParseTupleAndKeywords(
+            args, kwargs, "|ssssssss", kwlist,
+            &(self->host), &(self->port), &(self->username),
+            &(self->dbname), &(self->password), &(self->progname),
+            &(self->decoder), &(self->slot))){
         return -1;
-    Py_INCREF(self->conn_params);
-    self->conn = GetConnectionFromPyMap(self->conn_params, false);
-    if (!self->conn)
-        return -1;
+    }
+
     self->progname = "pylogicaldecoding";
-    self->conn = NULL;
     self->decoded_lsn = InvalidXLogRecPtr;
-    return 0;
+    // test a connection
+    return reader_connect(self);
 }
 
 static PyObject *
@@ -122,7 +278,6 @@ reader_start(readerObject *self)
              *pValue = NULL,
              *result = NULL;
 
-    char *replication_slot = "test_slot";
     char **options=NULL;
     int standby_message_timeout = 10 * 1000;
 
@@ -139,10 +294,8 @@ reader_start(readerObject *self)
      * Connect in replication mode to the server
      */
     {
-        if (!self->conn)
-            self->conn = GetConnectionFromPyMap(self->conn_params, true);
-        if (!self->conn)
-            /* TODO: raise */
+        if (!reader_connect(self))
+            // exception is setted in reader_connect...
             return NULL;
     }
 
@@ -153,11 +306,11 @@ reader_start(readerObject *self)
         fprintf(stderr,
                 "%s: starting log streaming at %X/%X (slot %s)\n",
                 self->progname, (uint32_t) (startpos >> 32), (uint32_t) startpos,
-                replication_slot);
+                self->slot);
 
     /* Initiate the replication stream at specified location */
     appendPQExpBuffer(query, "START_REPLICATION SLOT \"%s\" LOGICAL %X/%X",
-            replication_slot, (uint32_t) (startpos >> 32), (uint32_t) startpos);
+            self->slot, (uint32_t) (startpos >> 32), (uint32_t) startpos);
 
     /* print options if there are any */
     if (noptions)
@@ -480,7 +633,7 @@ static struct PyMethodDef reader_methods[] = {
 };
 
 static struct PyMemberDef reader_members[] = {
-    {"conn_params", T_OBJECT, offsetof(readerObject, conn_params), READONLY},
+    /*{"conn_params", T_OBJECT, offsetof(readerObject, conn_params), READONLY},*/
     {NULL}
 };
 
@@ -539,167 +692,6 @@ PyTypeObject readerType = {
     0,          /*tp_alloc*/
     reader_new, /*tp_new*/
 };
-
-PGconn *
-GetConnectionFromPyMap(PyObject *conn_map, bool replication)
-{
-    PGconn	   *tmpconn = NULL;
-    int			argcount = 7;	/* dbname, replication, fallback_app_name,
-                                 * host, user, port, password */
-    int			i;
-    const char **keywords;
-    const char **values;
-    const char *tmpparam;
-    PQconninfoOption *conn_opts = NULL;
-    char	   *dbhost = NULL;
-    char	   *dbuser = NULL;
-    char	   *dbport = NULL;
-    char	   *dbname = NULL;
-    char       *dbpassword = NULL;
-    char       *progname = "pylogicaldecoding";
-
-
-    /* load map */
-    i = 0;
-
-    {
-        keywords = pg_malloc0((argcount + 1) * sizeof(*keywords));
-        values = pg_malloc0((argcount + 1) * sizeof(*values));
-    }
-
-    keywords[i] = "dbname";
-    dbname = py_map_get_string_or_null(conn_map, "dbname");
-    if (PyErr_Occurred()) {goto error;}
-    values[i] = dbname == NULL ? "replication" : dbname;
-    i++;
-
-    keywords[i] = "replication";
-    values[i] = dbname == NULL ? "true" : replication ? "database" : "false";
-    //values[i] = dbname == NULL ? "true" : "database";
-    i++;
-
-
-
-    progname = py_map_get_string_or_null(conn_map, "progname");
-    if (PyErr_Occurred()) {
-        goto error;}
-    if (progname)
-    {
-        keywords[i] = "fallback_application_name";
-        values[i] = progname;
-        i++;
-    }
-
-    dbhost = py_map_get_string_or_null(conn_map, "host");
-    if (PyErr_Occurred()) {goto error;}
-    if (dbhost)
-    {
-        keywords[i] = "host";
-        values[i] = dbhost;
-        i++;
-    }
-
-    dbuser = py_map_get_string_or_null(conn_map, "username");
-    if (PyErr_Occurred()) {goto error;}
-    if (dbuser)
-    {
-        keywords[i] = "user";
-        values[i] = dbuser;
-        i++;
-    }
-
-    dbport = py_map_get_string_or_null(conn_map, "port");
-    if (PyErr_Occurred()) {goto error;}
-    if (dbport)
-    {
-        keywords[i] = "port";
-        values[i] = dbport;
-        i++;
-    }
-
-    dbpassword = py_map_get_string_or_null(conn_map, "password");
-    if (PyErr_Occurred()) {goto error;}
-    if (dbpassword)
-    {
-        keywords[i] = "password";
-        values[i] = dbpassword;
-        i++;
-    }
-
-    tmpconn = PQconnectdbParams(keywords, values, true);
-
-    /*
-        * If there is too little memory even to allocate the PGconn object
-        * and PQconnectdbParams returns NULL, we call exit(1) directly.
-        */
-    if (!tmpconn)
-    {
-        PyErr_NoMemory();
-        goto error;
-    }
-
-    /* If we need a password and -w wasn't given, loop back and get one */
-    if (PQstatus(tmpconn) == CONNECTION_BAD)
-    {
-        if (PQconnectionNeedsPassword(tmpconn))
-            PyErr_SetString(PyExc_ValueError, "password needed");
-        else
-            /*PyErr_SetString(PyExc_IOError,*/
-                /*"could not connect to server\n");*/
-            PyErr_Format(PyExc_IOError,
-                "Could not connect to server: %s\n",
-                PQerrorMessage(tmpconn));
-        goto error;
-    }
-
-    if (PQstatus(tmpconn) != CONNECTION_OK)
-    //if (0)
-    {
-        PyErr_Format(PyExc_IOError,
-            "Could not connect to server: %s\n",
-             PQerrorMessage(tmpconn));
-        goto error;
-    }
-
-    /* Connection ok! */
-    free(values);
-    free(keywords);
-
-    if (conn_opts)
-        PQconninfoFree(conn_opts);
-
-    /*
-     * Ensure we have the same value of integer timestamps as the server we
-     * are connecting to.
-     */
-    tmpparam = PQparameterStatus(tmpconn, "integer_datetimes");
-    if (!tmpparam)
-    {
-        PyErr_SetString(PyExc_ValueError,
-                "Could not determine server setting for integer_datetimes");
-        goto error;
-    }
-
-// TODO: check why pg_basebackup does check this precompiler stuff
-//#ifdef HAVE_INT64_TIMESTAMP
-    if (strcmp(tmpparam, "on") != 0)
-//#else
-//        if (strcmp(tmpparam, "off") != 0)
-//#endif
-        {
-            PyErr_SetString(PyExc_ValueError,
-                    "Integer_datetimes compile flag does not match server");
-            goto error;
-        }
-
-    return tmpconn;
-error:
-    free(values);
-    free(keywords);
-    if (tmpconn)
-        PQfinish(tmpconn);
-    return NULL;
-}
 
 static bool
 reader_sendFeedback(readerObject *self, int64_t now, bool force, bool replyRequested)
