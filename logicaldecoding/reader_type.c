@@ -19,6 +19,8 @@
 
 static volatile sig_atomic_t global_abort = false;
 
+bool verbose = true;
+
 typedef struct readerObject{
     PyObject_HEAD
     char *host;
@@ -29,8 +31,10 @@ typedef struct readerObject{
     char *progname;
     char *decoder;
     char *slot;
+    char create_slot;
     PGconn *conn;
     bool abort;
+    XLogRecPtr startpos; // where we start the replication (0/0 atm)
     XLogRecPtr decoded_lsn; // log level successfully sent to user's callback
     XLogRecPtr commited_lsn; // acked log level
 } readerObject;
@@ -232,23 +236,26 @@ reader_init(PyObject *obj, PyObject *args, PyObject *kwargs)
     readerObject *self = (readerObject *)obj;
     static char *kwlist[] = {
         "host", "port", "username", "dbname", "password",
-        "progname", "decoder", "slot", NULL};
+        "progname", "decoder", "slot", "create_slot", NULL};
 
     self->host=self->port=self->username=self->password = NULL;
     self->dbname = "postgres";
     self->progname = "pylogicaldecoding";
     self->decoder = "test_decoding";
-    self->slot = "test_slot";
+    self->slot = "test_slotssss";
+    self->create_slot = 1;
+    self->startpos = InvalidXLogRecPtr;
 
     // TODO: not sure where we should register the signal
     // maybe we should expose a function here called at module init.
     signal(SIGINT, sigint_handler);
 
     if (!PyArg_ParseTupleAndKeywords(
-            args, kwargs, "|ssssssss", kwlist,
+            args, kwargs, "|ssssssssb", kwlist,
             &(self->host), &(self->port), &(self->username),
             &(self->dbname), &(self->password), &(self->progname),
-            &(self->decoder), &(self->slot))){
+            &(self->decoder), &(self->slot), &(self->create_slot)))
+    {
         return -1;
     }
 
@@ -265,25 +272,82 @@ reader_stop(readerObject *self)
     Py_RETURN_NONE;
 }
 
+static int
+reader_create_slot(readerObject *self)
+{
+    char		query[256];
+    PGresult    *res;
+    uint32_t    hi,
+                lo;
+    puts("create slot"); fflush(stdout);
+
+    if (verbose)
+        fprintf(stderr,
+                "%s: creating replication slot \"%s\"\n",
+                self->progname, self->slot);
+
+    snprintf(query, sizeof(query), "CREATE_REPLICATION_SLOT \"%s\" LOGICAL \"%s\"",
+                self->slot, self->decoder);
+
+    res = PQexec(self->conn, query);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK)
+    {
+        char *err_code = PQresultErrorField(res, PG_DIAG_SQLSTATE);
+        PyErr_Format(PyExc_ValueError,
+                "%s: could not send replication command \"%s\": %s %s\n",
+                self->progname, query, PQerrorMessage(self->conn), err_code);
+        goto error;
+    }
+
+    if (PQntuples(res) != 1 || PQnfields(res) != 4)
+    {
+        char *err_code = PQresultErrorField(res, PG_DIAG_SQLSTATE);
+        PyErr_Format(PyExc_ValueError,
+                "%s: could not create replication slot \"%s\": got %d rows and %d fields, expected %d rows and %d fields\n%s\n",
+                self->progname, self->slot, PQntuples(res), PQnfields(res), 1, 4, err_code);
+        goto error;
+    }
+
+    if (sscanf(PQgetvalue(res, 0, 1), "%X/%X", &hi, &lo) != 2)
+    {
+        char *err_code = PQresultErrorField(res, PG_DIAG_SQLSTATE);
+        PyErr_Format(PyExc_ValueError,
+                "%s: could not parse transaction log location \"%s\"\n%s\n",
+                self->progname, PQgetvalue(res, 0, 1), err_code);
+        goto error;
+    }
+    self->startpos = ((uint64_t) hi) << 32 | lo;
+
+    // pg_recvlogical does this, I'm quite not sure why
+    self->slot = strdup(PQgetvalue(res, 0, 0));
+
+    PQclear(res);
+
+    puts("slot created"); fflush(stdout);
+    return 1;
+error:
+    PQclear(res);
+    return 0;
+}
+
 static PyObject *
 reader_start(readerObject *self)
 {
-    PGresult   *res;
-    char	   *copybuf = NULL;
-    int64_t		last_status = -1;
-    int			i;
+    PGresult    *res;
+    char        *copybuf = NULL;
+    int64_t     last_status = -1;
+    int         i;
     PQExpBuffer query;
-    PyObject *pFunc = NULL,
-             *pArgs = NULL,
-             *pValue = NULL,
-             *result = NULL;
+    PyObject    *pFunc = NULL,
+                *pArgs = NULL,
+                *pValue = NULL,
+                *result = NULL;
 
     char **options=NULL;
     int standby_message_timeout = 10 * 1000;
 
-    bool verbose=false;
+    /*bool verbose=false;*/
     int noptions = 0;
-    XLogRecPtr startpos = InvalidXLogRecPtr;
     XLogRecPtr old_lsn = 0;
 
     self->abort = false;
@@ -305,12 +369,12 @@ reader_start(readerObject *self)
     if (verbose)
         fprintf(stderr,
                 "%s: starting log streaming at %X/%X (slot %s)\n",
-                self->progname, (uint32_t) (startpos >> 32), (uint32_t) startpos,
+                self->progname, (uint32_t) (self->startpos >> 32), (uint32_t) self->startpos,
                 self->slot);
 
     /* Initiate the replication stream at specified location */
     appendPQExpBuffer(query, "START_REPLICATION SLOT \"%s\" LOGICAL %X/%X",
-            self->slot, (uint32_t) (startpos >> 32), (uint32_t) startpos);
+            self->slot, (uint32_t) (self->startpos >> 32), (uint32_t) self->startpos);
 
     /* print options if there are any */
     if (noptions)
@@ -333,16 +397,43 @@ reader_start(readerObject *self)
     if (noptions)
         appendPQExpBufferChar(query, ')');
 
+exec:
     res = PQexec(self->conn, query->data);
     if (PQresultStatus(res) != PGRES_COPY_BOTH)
     {
-        PyErr_Format(PyExc_ValueError,
-                "Could not send replication command \"%s\": %s",
-                query->data, PQresultErrorMessage(res));
-        PQclear(res);
-        goto error;
+        char *err_code = PQresultErrorField(res, PG_DIAG_SQLSTATE);
+        if (self->create_slot && !strcmp(err_code, "42704"))
+        {
+            if (!reader_create_slot(self))
+            {
+                PQclear(res);
+                goto error;
+            }
+            self->create_slot = 0;
+
+            // TODO: check if the decoder is the good one...
+
+            // TODO: not sure if it is mandatory to spawn an new connection
+            PQfinish(self->conn);
+            self->conn = NULL;
+            reader_connect(self);
+            PQclear(res);
+            goto exec;
+        }
+        else
+        {
+            char *error_msg = PQresultErrorMessage(res);
+            PyErr_Format(PyExc_ValueError,
+                    "Could not send replication command \"%s\": %s",
+                    query->data, error_msg);
+            PQclear(res);
+            goto error;
+        }
     }
+
+    self->create_slot=0;
     PQclear(res);
+
     resetPQExpBuffer(query);
 
     if (verbose)
@@ -503,7 +594,6 @@ reader_start(readerObject *self)
             replyRequested = copybuf[pos];
 
             /* If the server requested an immediate reply, send one. */
-            // TODO: no exception set!
             if (replyRequested)
             {
                 now = feGetCurrentTimestamp();
