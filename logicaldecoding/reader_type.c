@@ -3,6 +3,20 @@
 #include "connection.h"
 #include "streamutils.h"
 
+#define reader_start_doc \
+"start() -> start the main loop"
+
+#define reader_stop_doc \
+"stop() -> stop the main loop"
+
+#define reader_commit_doc \
+"commit() -> send feedback message acking all preceding stream\n"\
+"It's user's responsability to send regular acknowledgemnts. If"\
+"ommited, the master keeps all it's WAL on disk and eventually"\
+"Cthulhu eats the physical server (or something like that, I"\
+"just can't find this damn server, now)"
+
+
 static volatile sig_atomic_t global_abort = false;
 
 typedef struct readerObject{
@@ -25,8 +39,7 @@ static bool
 reader_sendFeedback(readerObject *self, int64_t now, bool force, bool replyRequested);
 
 /*
- * When sigint is called, just tell the system to exit at the next possible
- * moment.
+ * tell the main loop to exit at the next possible moment.
  */
 static void
 sigint_handler(int signum)
@@ -51,19 +64,6 @@ py_map_get_string_or_null(PyObject *o, char *key)
     Py_DECREF(val);
     return result;
 }
-
-#define reader_start_doc \
-"start() -> start the main loop"
-
-#define reader_stop_doc \
-"stop() -> stop the main loop"
-
-#define reader_commit_doc \
-"commit() -> send feedback message acking all preceding stream\n"\
-"It's user's responsability to send regular acknowledgemnts. If"\
-"ommited, the master keeps all it's WAL on disk and eventually"\
-"Cthulhu eats the physical server (or something like that, I"\
-"just can't find this damn server, now)"
 
 
 static PyObject *
