@@ -28,21 +28,27 @@ typedef struct slotStatus{
 
 typedef struct readerObject{
     PyObject_HEAD
-    char *host;
-    char *port;
-    char *username;
-    char *dbname;
-    char *password;
-    char *progname;
-    char *plugin;
-    char *slot;
-    char create_slot;
-    PGconn *conn;
-    PGconn *regularConn;
-    bool abort;
-    XLogRecPtr startpos; // where we start the replication (0/0 atm)
-    XLogRecPtr decoded_lsn; // log level successfully sent to user's callback
-    XLogRecPtr commited_lsn; // acked log level
+
+    // object properties
+    char        *host;
+    char        *port;
+    char        *username;
+    char        *dbname;
+    char        *password;
+    char        *progname;
+    char        *plugin;
+    char        *slot;
+    char        create_slot;
+    int         standby_message_timeout; // feedback interval in ms
+
+    // internals
+    PGconn      *conn;
+    PGconn      *regularConn;
+    bool        abort;
+    XLogRecPtr  startpos; // where we start the replication (0/0 atm)
+    XLogRecPtr  decoded_lsn; // log level successfully sent to user's callback
+    XLogRecPtr  commited_lsn; // acked log level
+    int64_t     last_status;
 } readerObject;
 
 static int
@@ -255,7 +261,7 @@ reader_init(PyObject *obj, PyObject *args, PyObject *kwargs)
     readerObject *self = (readerObject *)obj;
     static char *kwlist[] = {
         "host", "port", "username", "dbname", "password",
-        "progname", "plugin", "slot", "create_slot", NULL};
+        "progname", "plugin", "slot", "create_slot", "feedback_interval", NULL};
 
     self->host=self->port=self->username=self->password = NULL;
     self->dbname = "postgres";
@@ -264,22 +270,22 @@ reader_init(PyObject *obj, PyObject *args, PyObject *kwargs)
     self->slot = "test_slot";
     self->create_slot = 1;
     self->startpos = InvalidXLogRecPtr;
+    self->standby_message_timeout = 10 * 1000;
 
     // TODO: not sure where we should register the signal
     // maybe we should expose a function here called at module init.
     signal(SIGINT, sigint_handler);
 
     if (!PyArg_ParseTupleAndKeywords(
-            args, kwargs, "|ssssssssb", kwlist,
+            args, kwargs, "|ssssssssbi", kwlist,
             &(self->host), &(self->port), &(self->username),
             &(self->dbname), &(self->password), &(self->progname),
-            &(self->plugin), &(self->slot), &(self->create_slot)))
-    {
+            &(self->plugin), &(self->slot), &(self->create_slot),
+            &(self->standby_message_timeout)))
         return -1;
-    }
 
-    self->progname = "pylogicaldecoding";
     self->decoded_lsn = InvalidXLogRecPtr;
+    self->last_status = -1;
     // test a connection
     return reader_connect(self, true);
 }
@@ -414,6 +420,38 @@ error:
     return 0;
 }
 
+/* Compute when we need to wakeup to send a keepalive message. */
+struct timeval*
+reader_compute_wakeup(readerObject *self, int64_t now, struct timeval *timeout)
+{
+    int64_t message_target = 0;
+
+    if (self->standby_message_timeout)
+        message_target = self->last_status + (self->standby_message_timeout - 1) *
+            ((int64_t) 1000);
+
+    /* Now compute when to wakeup. */
+    if (message_target > 0 )
+    {
+        int64_t     targettime;
+        long        secs;
+        int         usecs;
+
+        targettime = message_target;
+
+        feTimestampDifference(now,
+                targettime,
+                &secs,
+                &usecs);
+        if (secs <= 0)
+            timeout->tv_sec = 1; /* Always sleep at least 1 sec */
+        else
+            timeout->tv_sec = secs;
+        timeout->tv_usec = usecs;
+    }
+    return NULL;
+}
+
 /* main loop
  * listen on connection, call user's callbacks and send feedback to origin
  * */
@@ -422,7 +460,6 @@ reader_start(readerObject *self)
 {
     PGresult    *res = NULL;
     char        *copybuf = NULL;
-    int64_t     last_status = -1;
     int         i;
     PQExpBuffer query;
     PyObject    *pFunc = NULL,
@@ -431,11 +468,12 @@ reader_start(readerObject *self)
                 *result = NULL;
 
     char        **options=NULL;
-    int         standby_message_timeout = 10 * 1000;
 
     int         noptions = 0;
     XLogRecPtr  old_lsn = 0;
     slotStatus  *status = NULL;
+
+    static bool first_loop = true;
 
     self->abort = false;
     query = createPQExpBuffer();
@@ -468,6 +506,7 @@ reader_start(readerObject *self)
     }
     else
     {
+        // check plugin name
         if (strcmp(self->plugin, status->plugin))
         {
             PyErr_Format(PyExc_ValueError,
@@ -541,10 +580,9 @@ reader_start(readerObject *self)
 
     while (!global_abort && !self->abort)
     {
-        int			r;
-        int64_t		now;
-        int			hdr_len;
-        static bool first_loop = true;
+        int         r;
+        int64_t     now;
+        int         hdr_len;
 
         if (copybuf != NULL)
         {
@@ -557,9 +595,9 @@ reader_start(readerObject *self)
          */
         now = feGetCurrentTimestamp();
 
-        if (first_loop || (standby_message_timeout > 0 &&
-                feTimestampDifferenceExceeds(last_status, now,
-                    standby_message_timeout)))
+        if (first_loop || (self->standby_message_timeout > 0 &&
+                feTimestampDifferenceExceeds(self->last_status, now,
+                    self->standby_message_timeout)))
         {
             /* Time to send feedback! */
             if (!reader_sendFeedback(self, now, true, false))
@@ -567,12 +605,11 @@ reader_start(readerObject *self)
                 goto error;
             }
 
-            last_status = now;
+            self->last_status = now;
         }
         first_loop=false;
 
         r = PQgetCopyData(self->conn, &copybuf, 1);
-        //fprintf(stderr, "data len : %i\n", r); fflush(stderr);
         if (r == 0)
         {
             /*
@@ -580,39 +617,15 @@ reader_start(readerObject *self)
              * not more than the specified timeout, so that we can send a
              * response back to the client.
              */
-            fd_set		input_mask;
-            int64_t		message_target = 0;
-            struct timeval timeout;
-            struct timeval *timeoutptr = NULL;
+            fd_set          input_mask;
+            struct timeval  timeout;
+            struct timeval  *timeoutptr = NULL;
+            /*int64_t         message_target = 0;*/
 
             FD_ZERO(&input_mask);
             FD_SET(PQsocket(self->conn), &input_mask);
 
-            /* Compute when we need to wakeup to send a keepalive message. */
-            if (standby_message_timeout)
-                message_target = last_status + (standby_message_timeout - 1) *
-                    ((int64_t) 1000);
-
-            /* Now compute when to wakeup. */
-            if (message_target > 0 )
-            {
-                int64_t		targettime;
-                long		secs;
-                int			usecs;
-
-                targettime = message_target;
-
-                feTimestampDifference(now,
-                        targettime,
-                        &secs,
-                        &usecs);
-                if (secs <= 0)
-                    timeout.tv_sec = 1; /* Always sleep at least 1 sec */
-                else
-                    timeout.tv_sec = secs;
-                timeout.tv_usec = usecs;
-                timeoutptr = &timeout;
-            }
+            timeoutptr = reader_compute_wakeup(self, now, &timeout);
 
             r = select(PQsocket(self->conn) + 1, &input_mask, NULL, NULL, timeoutptr);
             if (r == 0 || (r < 0 && errno == EINTR))
@@ -642,7 +655,6 @@ reader_start(readerObject *self)
             }
             continue;
         }
-        //fprintf(stderr, "header: %s\n", copybuf + 25); fflush(stderr);
 
         /* End of copy stream */
         if (r == -1)
@@ -696,7 +708,7 @@ reader_start(readerObject *self)
                 {
                     goto error;
                 }
-                last_status = now;
+                self->last_status = now;
             }
             continue;
         }
