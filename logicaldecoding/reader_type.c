@@ -332,6 +332,7 @@ reader_slot_status(readerObject *self)
         goto error;
     }
 
+
     status = pg_malloc0(sizeof(slotStatus));
 
     // the slot exists
@@ -340,6 +341,9 @@ reader_slot_status(readerObject *self)
         // only slot_name and plugin ATM TODO:
         status->slot_name = strdup(PQgetvalue(res, 0, 0));
         status->plugin = strdup(PQgetvalue(res, 0, 1));
+    }
+    else{
+        status->slot_name = "";
     }
 
     PQclear(res);
@@ -361,7 +365,6 @@ reader_create_slot(readerObject *self)
     PGresult    *res;
     uint32_t    hi,
                 lo;
-    puts("create slot"); fflush(stdout);
 
     if (verbose)
         fprintf(stderr,
@@ -405,7 +408,6 @@ reader_create_slot(readerObject *self)
 
     PQclear(res);
 
-    puts("slot created"); fflush(stdout);
     return 1;
 error:
     PQclear(res);
@@ -445,24 +447,34 @@ reader_start(readerObject *self)
     // got an error
     if (!status)
         goto error;
-    // no status available, probably no slot at all
-    if(status->slot_name[0] == '\0'){
+    // no slot
+    if(strlen(status->slot_name) == 0){
+        // create the slot if requested
         if (self->create_slot)
         {
             if (!reader_create_slot(self))
             {
                 goto error;
             }
-            puts("created");
             self->create_slot = 0;
+        }
+        else
+        {
+            PyErr_Format(PyExc_ValueError,
+                    "Slot \"%s\" does not exist",
+                    self->slot);
+            goto error;
         }
     }
     else
     {
-        puts("slot_name: ");
-        puts(status->slot_name);
-        puts("\nplugin: ");
-        puts(status->plugin);
+        if (strcmp(self->plugin, status->plugin))
+        {
+            PyErr_Format(PyExc_ValueError,
+                    "Slot \"%s\" uses pluguin \"%s\". You required \"%s\"",
+                    self->slot, status->plugin, self->plugin);
+            goto error;
+        }
     }
 
 
@@ -519,43 +531,6 @@ reader_start(readerObject *self)
                 query->data, error_msg);
         goto error;
     }
-
-/* { commented...
-exec:
-    {
-        char *err_code = PQresultErrorField(res, PG_DIAG_SQLSTATE);
-        // "42704" -> slot not found. Create it if the user asked to
-        if (self->create_slot && !strcmp(err_code, "42704"))
-        {
-            if (!reader_create_slot(self))
-            {
-                PQclear(res);
-                goto error;
-            }
-            self->create_slot = 0;
-
-            // TODO: not sure if it is mandatory to spawn an new connection
-            PQfinish(self->conn);
-            self->conn = NULL;
-            reader_connect(self, true);
-            PQclear(res);
-            goto exec;
-        }
-        else
-        {
-            char *error_msg = pqresulterrormessage(res);
-            pyerr_format(pyexc_valueerror,
-                    "could not send replication command \"%s\": %s",
-                    query->data, error_msg);
-            pqclear(res);
-            goto error;
-        }
-    }
-    // TODO: check if the plugin is the good one...
-
-    self->create_slot=0;
-    PQclear(res);
-    }*/
 
     resetPQExpBuffer(query);
 
