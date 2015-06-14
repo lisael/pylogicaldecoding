@@ -53,6 +53,8 @@ typedef struct readerObject{
 
 static int
 reader_sendFeedback(readerObject *self, int64_t now, bool force, bool replyRequested);
+int
+reader_commit(readerObject *self);
 
 /*
  * tell the main loop to exit at the next possible moment.
@@ -448,8 +450,114 @@ reader_compute_wakeup(readerObject *self, int64_t now, struct timeval *timeout)
         else
             timeout->tv_sec = secs;
         timeout->tv_usec = usecs;
+        return timeout;
     }
     return NULL;
+}
+
+int
+reader_reply_keepalive(readerObject *self, char *copybuf, int buf_len)
+{
+    int         pos;
+    bool        replyRequested;
+    XLogRecPtr  walEnd;
+
+    /*
+     * Parse the keepalive message, enclosed in the CopyData message.
+     * We just check if the server requested a reply, and ignore the
+     * rest.
+     */
+    pos = 1;  /* skip msgtype 'k' */
+    walEnd = fe_recvint64(&copybuf[pos]);
+    self->decoded_lsn = Max(walEnd, self->decoded_lsn);
+    pos += 8;  /* read walEnd */
+    pos += 8;  /* skip sendTime */
+
+    if (buf_len < pos + 1)
+    {
+        PyErr_Format(PyExc_ValueError,
+                "Streaming header too small: %d\n",
+                buf_len);
+        return 0;
+    }
+    replyRequested = copybuf[pos];
+
+    /* If the server requested an immediate reply, send one. */
+    if (replyRequested)
+    {
+        int64_t now = feGetCurrentTimestamp();
+        if (!reader_sendFeedback(self, now, true, false))
+        {
+            return 0;
+        }
+        self->last_status = now;
+    }
+    return 1;
+}
+
+int
+reader_consume_stream(readerObject *self, char *copybuf, int buf_len)
+{
+    PyObject    *pFunc = NULL,
+                *pArgs = NULL,
+                *pValue = NULL,
+                *result = NULL;
+    int hdr_len;
+    XLogRecPtr old_lsn;
+    /*
+     * Read the header of the XLogData message, enclosed in the CopyData
+     * message. We only need the WAL location field (dataStart), the rest
+     * of the header is ignored.
+     */
+    hdr_len = 1;			/* msgtype 'w' */
+    hdr_len += 8;			/* dataStart */
+    hdr_len += 8;			/* walEnd */
+    hdr_len += 8;			/* sendTime */
+    if (buf_len < hdr_len + 1)
+    {
+        PyErr_Format(PyExc_ValueError,
+                "Streaming header too small: %d\n",
+                buf_len);
+        return 0;
+    }
+
+    /* Extract WAL location for this block */
+    {
+        XLogRecPtr	temp = fe_recvint64(&copybuf[1]);
+        old_lsn = self->decoded_lsn;
+        self->decoded_lsn = Max(temp, self->decoded_lsn);
+    }
+
+
+    /* call users callback */
+    {
+        pFunc = PyObject_GetAttrString((PyObject *)self, "event");
+        if (pFunc == NULL){goto error;}
+        pArgs = PyTuple_New(1);
+        if (pArgs == NULL){goto error;}
+        pValue = Text_FromUTF8(copybuf + hdr_len);
+        Py_INCREF(pValue);
+        if (pValue == NULL){goto error;}
+        PyTuple_SetItem(pArgs, 0, pValue);
+        result = PyObject_CallObject(pFunc, pArgs);
+        if (result == NULL){goto error;}
+        old_lsn = 0;
+        Py_DECREF(pFunc);
+        Py_DECREF(pArgs);
+        Py_DECREF(pValue);
+        Py_DECREF(result);
+    }
+    return 1;
+
+error:
+    if(old_lsn){
+        self->decoded_lsn = old_lsn;
+    }
+    Py_XDECREF(pFunc);
+    Py_XDECREF(pArgs);
+    Py_XDECREF(pValue);
+    Py_XDECREF(result);
+    return 0;
 }
 
 /* main loop
@@ -462,15 +570,10 @@ reader_start(readerObject *self)
     char        *copybuf = NULL;
     int         i;
     PQExpBuffer query;
-    PyObject    *pFunc = NULL,
-                *pArgs = NULL,
-                *pValue = NULL,
-                *result = NULL;
 
     char        **options=NULL;
 
     int         noptions = 0;
-    XLogRecPtr  old_lsn = 0;
     slotStatus  *status = NULL;
 
     static bool first_loop = true;
@@ -582,7 +685,6 @@ reader_start(readerObject *self)
     {
         int         r;
         int64_t     now;
-        int         hdr_len;
 
         if (copybuf != NULL)
         {
@@ -620,12 +722,11 @@ reader_start(readerObject *self)
             fd_set          input_mask;
             struct timeval  timeout;
             struct timeval  *timeoutptr = NULL;
-            /*int64_t         message_target = 0;*/
+
+            timeoutptr = reader_compute_wakeup(self, now, &timeout);
 
             FD_ZERO(&input_mask);
             FD_SET(PQsocket(self->conn), &input_mask);
-
-            timeoutptr = reader_compute_wakeup(self, now, &timeout);
 
             r = select(PQsocket(self->conn) + 1, &input_mask, NULL, NULL, timeoutptr);
             if (r == 0 || (r < 0 && errno == EINTR))
@@ -674,41 +775,8 @@ reader_start(readerObject *self)
         /* Check the message type. */
         if (copybuf[0] == 'k')
         {
-            int			pos;
-            bool		replyRequested;
-            XLogRecPtr	walEnd;
-
-            /*
-             * Parse the keepalive message, enclosed in the CopyData message.
-             * We just check if the server requested a reply, and ignore the
-             * rest.
-             */
-            pos = 1;			/* skip msgtype 'k' */
-            walEnd = fe_recvint64(&copybuf[pos]);
-            self->decoded_lsn = Max(walEnd, self->decoded_lsn);
-
-            pos += 8;			/* read walEnd */
-
-            pos += 8;			/* skip sendTime */
-
-            if (r < pos + 1)
-            {
-                PyErr_Format(PyExc_ValueError,
-                        "Streaming header too small: %d\n",
-                        r);
+            if (!reader_reply_keepalive(self, copybuf, r)){
                 goto error;
-            }
-            replyRequested = copybuf[pos];
-
-            /* If the server requested an immediate reply, send one. */
-            if (replyRequested)
-            {
-                now = feGetCurrentTimestamp();
-                if (!reader_sendFeedback(self, now, true, false))
-                {
-                    goto error;
-                }
-                self->last_status = now;
             }
             continue;
         }
@@ -720,50 +788,8 @@ reader_start(readerObject *self)
             goto error;
         }
 
-
-        /*
-         * Read the header of the XLogData message, enclosed in the CopyData
-         * message. We only need the WAL location field (dataStart), the rest
-         * of the header is ignored.
-         */
-        hdr_len = 1;			/* msgtype 'w' */
-        hdr_len += 8;			/* dataStart */
-        hdr_len += 8;			/* walEnd */
-        hdr_len += 8;			/* sendTime */
-        if (r < hdr_len + 1)
-        {
-            PyErr_Format(PyExc_ValueError,
-                    "Streaming header too small: %d\n",
-                    r);
+        if (!reader_consume_stream(self, copybuf, r))
             goto error;
-        }
-
-        /* Extract WAL location for this block */
-        {
-            XLogRecPtr	temp = fe_recvint64(&copybuf[1]);
-            old_lsn = self->decoded_lsn;
-            self->decoded_lsn = Max(temp, self->decoded_lsn);
-        }
-
-
-        /* call users callback */
-        {
-            pFunc = PyObject_GetAttrString((PyObject *)self, "event");
-            if (pFunc == NULL){goto error;}
-            pArgs = PyTuple_New(1);
-            if (pArgs == NULL){goto error;}
-            pValue = Text_FromUTF8(copybuf + hdr_len);
-            Py_INCREF(pValue);
-            if (pValue == NULL){goto error;}
-            PyTuple_SetItem(pArgs, 0, pValue);
-            result = PyObject_CallObject(pFunc, pArgs);
-            if (result == NULL){goto error;}
-            old_lsn = 0;
-            Py_DECREF(pFunc);
-            Py_DECREF(pArgs);
-            Py_DECREF(pValue);
-            Py_DECREF(result);
-        }
     }
 
     res = PQgetResult(self->conn);
@@ -786,22 +812,23 @@ error:
         PQfreemem(copybuf);
         copybuf = NULL;
     }
-    if(old_lsn){
-        self->decoded_lsn = old_lsn;
-    }
     if (res)
         PQclear(res);
     destroyPQExpBuffer(query);
     PQfinish(self->conn);
     self->conn = NULL;
-    Py_XDECREF(pFunc);
-    Py_XDECREF(pArgs);
-    Py_XDECREF(pValue);
-    Py_XDECREF(result);
     return NULL;
 }
 
 static PyObject *
+py_reader_commit(readerObject *self)
+{
+    if(!reader_commit(self))
+        return NULL;
+    Py_RETURN_NONE;
+}
+
+int
 reader_commit(readerObject *self)
 {
     int64_t now = feGetCurrentTimestamp();
@@ -811,9 +838,9 @@ reader_commit(readerObject *self)
     if (!reader_sendFeedback(self, now, true, false))
     {
         self->commited_lsn = old_lsn;
-        return NULL;
+        return 0;
     }
-    Py_RETURN_NONE;
+    return 1;
 }
 
 static struct PyMethodDef reader_methods[] = {
@@ -821,7 +848,7 @@ static struct PyMethodDef reader_methods[] = {
     reader_start_doc},
     {"stop", (PyCFunction)reader_stop, METH_NOARGS,
     reader_stop_doc},
-    {"commit", (PyCFunction)reader_commit, METH_NOARGS,
+    {"commit", (PyCFunction)py_reader_commit, METH_NOARGS,
     reader_commit_doc},
     {NULL}
 };
