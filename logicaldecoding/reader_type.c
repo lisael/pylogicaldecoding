@@ -67,62 +67,6 @@ sigint_handler(int signum)
     global_abort = true;
 }
 
-char *
-py_map_get_string_or_null(PyObject *o, char *key)
-{
-    PyObject *val, *ascii_string;
-    char *str, *result;
-    val = PyMapping_GetItemString(o, key);
-    if (val == NULL || val == Py_None)
-        return NULL;
-    ascii_string = PyUnicode_AsASCIIString(val);
-    if (!ascii_string) return NULL;
-    str = Bytes_AsString(ascii_string);
-    result = malloc(strlen(str)+1 * sizeof(char));
-    strcpy(result, str);
-    Py_DECREF(ascii_string);
-    Py_DECREF(val);
-    return result;
-}
-
-
-static PyObject *
-reader_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
-{
-    return type->tp_alloc(type, 0);
-}
-
-static PyObject *
-reader_repr(readerObject *self)
-{
-    return PyString_FromFormat(
-        "<Reader object at %p, slot=`%s`>", self, self->slot);
-}
-
-static void
-reader_dealloc(PyObject* obj)
-{
-    readerObject *self = (readerObject *)obj;
-
-    if (self->conn)
-        PQfinish(self->conn);
-
-    // TODO: these come from PyParseArgs. Not sure if free is
-    // perfectly safe
-    {
-        free(self->host);
-        free(self->port);
-        free(self->username);
-        free(self->dbname);
-        free(self->password);
-        free(self->progname);
-        free(self->plugin);
-        free(self->slot);
-    }
-
-    Py_TYPE(obj)->tp_free(obj);
-}
-
 static int
 reader_connect(readerObject *self, bool replication)
 {
@@ -257,48 +201,6 @@ error:
     if (self->regularConn)
         PQfinish(self->regularConn);
     return 0;
-}
-
-static int
-reader_init(PyObject *obj, PyObject *args, PyObject *kwargs)
-{
-    readerObject *self = (readerObject *)obj;
-    static char *kwlist[] = {
-        "host", "port", "username", "dbname", "password",
-        "progname", "plugin", "slot", "create_slot", "feedback_interval", NULL};
-
-    self->host=self->port=self->username=self->password = NULL;
-    self->dbname = "postgres";
-    self->progname = "pylogicaldecoding";
-    self->plugin = "test_decoding";
-    self->slot = "test_slot";
-    self->create_slot = 1;
-    self->startpos = InvalidXLogRecPtr;
-    self->standby_message_timeout = 10 * 1000;
-
-    // TODO: not sure where we should register the signal
-    // maybe we should expose a function here called at module init.
-    signal(SIGINT, sigint_handler);
-
-    if (!PyArg_ParseTupleAndKeywords(
-            args, kwargs, "|ssssssssbi", kwlist,
-            &(self->host), &(self->port), &(self->username),
-            &(self->dbname), &(self->password), &(self->progname),
-            &(self->plugin), &(self->slot), &(self->create_slot),
-            &(self->standby_message_timeout)))
-        return -1;
-
-    self->decoded_lsn = InvalidXLogRecPtr;
-    self->last_status = -1;
-    // test a connection
-    return reader_connect(self, true);
-}
-
-static PyObject *
-reader_stop(readerObject *self)
-{
-    self->abort = true;
-    Py_RETURN_NONE;
 }
 
 /* returns reader's slot current status
@@ -568,10 +470,108 @@ error:
     return 0;
 }
 
+int
+reader_commit(readerObject *self)
+{
+    int64_t now = feGetCurrentTimestamp();
+    XLogRecPtr old_lsn = self->commited_lsn;
+
+    self->commited_lsn = self->decoded_lsn;
+    if (!reader_sendFeedback(self, now, true, false))
+    {
+        self->commited_lsn = old_lsn;
+        return 0;
+    }
+    return 1;
+}
+
+int
+reader_drop_slot(readerObject *self)
+{
+    char    query[256];
+    PGresult    *res = NULL;
+
+    if (!self->conn && !reader_connect(self, true))
+        goto error;
+
+    if (verbose)
+        fprintf(stderr,
+                "%s: dropping replication slot \"%s\"\n",
+                self->progname, self->slot);
+
+    snprintf(query, sizeof(query), "DROP_REPLICATION_SLOT \"%s\"",
+            self->slot);
+    res = PQexec(self->conn, query);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK)
+    {
+        PyErr_Format(PyExc_ValueError,
+                "%s: could not send replication command \"%s\": %s",
+                self->progname, query, PQerrorMessage(self->conn));
+        goto error;
+    }
+
+    if (PQntuples(res) != 0 || PQnfields(res) != 0)
+    {
+        PyErr_Format(PyExc_ValueError,
+                "%s: could not drop replication slot \"%s\": got %d rows and %d fields, expected %d rows and %d fields\n",
+                self->progname, self->slot, PQntuples(res), PQnfields(res), 0, 0);
+        goto error;
+    }
+    PQclear(res);
+    return 1;
+error:
+    if(res)
+        PQclear(res);
+    return 0;
+}
+
+static int
+reader_sendFeedback(readerObject *self, int64_t now, bool force, bool replyRequested)
+{
+    char		replybuf[1 + 8 + 8 + 8 + 8 + 1];
+    int			len = 0;
+
+
+    if (!force &&
+            self->decoded_lsn == self->commited_lsn)
+        return 1;
+    if (verbose)
+    {
+        printf("feedback... %X/%X\n",
+                    (uint32_t) (self->commited_lsn >> 32), (uint32_t) self->commited_lsn);
+        fflush(stdout);
+    }
+
+    replybuf[len] = 'r';
+    len += 1;
+    fe_sendint64(self->commited_lsn, &replybuf[len]);	/* write */
+    len += 8;
+    fe_sendint64(self->commited_lsn, &replybuf[len]);		/* flush */
+    len += 8;
+    fe_sendint64(InvalidXLogRecPtr, &replybuf[len]);	/* apply */
+    len += 8;
+    fe_sendint64(now, &replybuf[len]);	/* sendTime */
+    len += 8;
+    replybuf[len] = replyRequested ? 1 : 0;		/* replyRequested */
+    len += 1;
+    if (!self->conn && !reader_connect(self, true))
+        // exception is setted in reader_connect...
+        return 0;
+    if (PQputCopyData(self->conn, replybuf, len) <= 0
+            || PQflush(self->conn))
+    {
+        PyErr_Format(PyExc_IOError,
+                    "Could not send feedback packet: %s",
+                    PQerrorMessage(self->conn));
+        return 0;
+    }
+    return 1;
+}
+
 /* main loop
  * listen on connection, call user's callbacks and send feedback to origin
  * */
-static PyObject *
+int
 reader_start(readerObject *self)
 {
     PGresult    *res = NULL;
@@ -812,7 +812,7 @@ reader_start(readerObject *self)
     destroyPQExpBuffer(query);
     PQfinish(self->conn);
     self->conn = NULL;
-    Py_RETURN_NONE;
+    return 1;
 
 error:
     if (copybuf != NULL)
@@ -825,7 +825,104 @@ error:
     destroyPQExpBuffer(query);
     PQfinish(self->conn);
     self->conn = NULL;
-    return NULL;
+    return 0;
+}
+
+int
+reader_stop(readerObject *self)
+{
+    self->abort = true;
+    return 1;
+}
+
+/* PYTHON STUFF */
+
+static int
+reader_init(PyObject *obj, PyObject *args, PyObject *kwargs)
+{
+    readerObject *self = (readerObject *)obj;
+    static char *kwlist[] = {
+        "host", "port", "username", "dbname", "password",
+        "progname", "plugin", "slot", "create_slot", "feedback_interval", NULL};
+
+    self->host=self->port=self->username=self->password = NULL;
+    self->dbname = "postgres";
+    self->progname = "pylogicaldecoding";
+    self->plugin = "test_decoding";
+    self->slot = "test_slot";
+    self->create_slot = 1;
+    self->startpos = InvalidXLogRecPtr;
+    self->standby_message_timeout = 10 * 1000;
+
+    // TODO: not sure where we should register the signal
+    // maybe we should expose a function here called at module init.
+    signal(SIGINT, sigint_handler);
+
+    if (!PyArg_ParseTupleAndKeywords(
+            args, kwargs, "|ssssssssbi", kwlist,
+            &(self->host), &(self->port), &(self->username),
+            &(self->dbname), &(self->password), &(self->progname),
+            &(self->plugin), &(self->slot), &(self->create_slot),
+            &(self->standby_message_timeout)))
+        return -1;
+
+    self->decoded_lsn = InvalidXLogRecPtr;
+    self->last_status = -1;
+    // test a connection
+    return reader_connect(self, true);
+}
+
+static PyObject *
+reader_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
+{
+    return type->tp_alloc(type, 0);
+}
+
+static PyObject *
+reader_repr(readerObject *self)
+{
+    return PyString_FromFormat(
+        "<Reader object at %p, slot=`%s`>", self, self->slot);
+}
+
+static void
+reader_dealloc(PyObject* obj)
+{
+    readerObject *self = (readerObject *)obj;
+
+    if (self->conn)
+        PQfinish(self->conn);
+
+    // TODO: these come from PyParseArgs. Not sure if free is
+    // perfectly safe
+    {
+        free(self->host);
+        free(self->port);
+        free(self->username);
+        free(self->dbname);
+        free(self->password);
+        free(self->progname);
+        free(self->plugin);
+        free(self->slot);
+    }
+
+    Py_TYPE(obj)->tp_free(obj);
+}
+
+static PyObject *
+py_reader_start(readerObject *self)
+{
+    if(!reader_start(self))
+        return NULL;
+    Py_RETURN_NONE;
+}
+
+static PyObject *
+py_reader_stop(readerObject *self)
+{
+    if(!reader_stop(self))
+        return NULL;
+    Py_RETURN_NONE;
 }
 
 static PyObject *
@@ -836,61 +933,6 @@ py_reader_commit(readerObject *self)
     Py_RETURN_NONE;
 }
 
-int
-reader_commit(readerObject *self)
-{
-    int64_t now = feGetCurrentTimestamp();
-    XLogRecPtr old_lsn = self->commited_lsn;
-
-    self->commited_lsn = self->decoded_lsn;
-    if (!reader_sendFeedback(self, now, true, false))
-    {
-        self->commited_lsn = old_lsn;
-        return 0;
-    }
-    return 1;
-}
-
-int
-reader_drop_slot(readerObject *self)
-{
-    char    query[256];
-    PGresult    *res = NULL;
-
-    if (!self->conn && !reader_connect(self, true))
-        goto error;
-
-    if (verbose)
-        fprintf(stderr,
-                "%s: dropping replication slot \"%s\"\n",
-                self->progname, self->slot);
-
-    snprintf(query, sizeof(query), "DROP_REPLICATION_SLOT \"%s\"",
-            self->slot);
-    res = PQexec(self->conn, query);
-    if (PQresultStatus(res) != PGRES_COMMAND_OK)
-    {
-        PyErr_Format(PyExc_ValueError,
-                "%s: could not send replication command \"%s\": %s",
-                self->progname, query, PQerrorMessage(self->conn));
-        goto error;
-    }
-
-    if (PQntuples(res) != 0 || PQnfields(res) != 0)
-    {
-        PyErr_Format(PyExc_ValueError,
-                "%s: could not drop replication slot \"%s\": got %d rows and %d fields, expected %d rows and %d fields\n",
-                self->progname, self->slot, PQntuples(res), PQnfields(res), 0, 0);
-        goto error;
-    }
-    PQclear(res);
-    return 1;
-error:
-    if(res)
-        PQclear(res);
-    return 0;
-}
-
 static PyObject *
 py_reader_drop_slot(readerObject *self)
 {
@@ -899,12 +941,10 @@ py_reader_drop_slot(readerObject *self)
     Py_RETURN_NONE;
 }
 
-
-
 static struct PyMethodDef reader_methods[] = {
-    {"start", (PyCFunction)reader_start, METH_NOARGS,
+    {"start", (PyCFunction)py_reader_start, METH_NOARGS,
     reader_start_doc},
-    {"stop", (PyCFunction)reader_stop, METH_NOARGS,
+    {"stop", (PyCFunction)py_reader_stop, METH_NOARGS,
     reader_stop_doc},
     {"commit", (PyCFunction)py_reader_commit, METH_NOARGS,
     reader_commit_doc},
@@ -973,49 +1013,3 @@ PyTypeObject readerType = {
     0,          /*tp_alloc*/
     reader_new, /*tp_new*/
 };
-
-static int
-reader_sendFeedback(readerObject *self, int64_t now, bool force, bool replyRequested)
-{
-    char		replybuf[1 + 8 + 8 + 8 + 8 + 1];
-    int			len = 0;
-
-
-    if (!force &&
-            self->decoded_lsn == self->commited_lsn)
-        return 1;
-    if (verbose)
-    {
-        printf("feedback... %X/%X\n",
-                    (uint32_t) (self->commited_lsn >> 32), (uint32_t) self->commited_lsn);
-        fflush(stdout);
-    }
-
-    replybuf[len] = 'r';
-    len += 1;
-    fe_sendint64(self->commited_lsn, &replybuf[len]);	/* write */
-    len += 8;
-    fe_sendint64(self->commited_lsn, &replybuf[len]);		/* flush */
-    len += 8;
-    fe_sendint64(InvalidXLogRecPtr, &replybuf[len]);	/* apply */
-    len += 8;
-    fe_sendint64(now, &replybuf[len]);	/* sendTime */
-    len += 8;
-    replybuf[len] = replyRequested ? 1 : 0;		/* replyRequested */
-    len += 1;
-    if (!self->conn && !reader_connect(self, true))
-        // exception is setted in reader_connect...
-        return 0;
-    if (PQputCopyData(self->conn, replybuf, len) <= 0
-            || PQflush(self->conn))
-    {
-        PyErr_Format(PyExc_IOError,
-                    "Could not send feedback packet: %s",
-                    PQerrorMessage(self->conn));
-        return 0;
-    }
-    return 1;
-}
-
-
-
