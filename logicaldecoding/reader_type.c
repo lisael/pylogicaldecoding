@@ -10,11 +10,13 @@
 "stop() -> stop the main loop"
 
 #define reader_commit_doc \
-"commit() -> send feedback message acking all preceding stream\n"\
+"commit() -> send feedback message acknowledging all preceding stream\n"\
 "It's user's responsability to send regular acknowledgemnts. If"\
 "ommited, the master keeps all it's WAL on disk and eventually"\
-"Cthulhu eats the physical server (or something like that, I"\
-"just can't find this damn server, now)"
+"Cthulhu eats the physical server"
+
+#define reader_drop_slot_doc \
+"drop_slot() -> drop the replication slot"
 
 
 static volatile sig_atomic_t global_abort = false;
@@ -370,9 +372,14 @@ static int
 reader_create_slot(readerObject *self)
 {
     char		query[256];
-    PGresult    *res;
+    PGresult    *res = NULL;
     uint32_t    hi,
                 lo;
+
+    if (!self->conn && !reader_connect(self, true))
+        // exception is setted in reader_connect...
+        goto error;
+
 
     if (verbose)
         fprintf(stderr,
@@ -418,7 +425,8 @@ reader_create_slot(readerObject *self)
 
     return 1;
 error:
-    PQclear(res);
+    if(res)
+        PQclear(res);
     return 0;
 }
 
@@ -843,6 +851,56 @@ reader_commit(readerObject *self)
     return 1;
 }
 
+int
+reader_drop_slot(readerObject *self)
+{
+    char    query[256];
+    PGresult    *res = NULL;
+
+    if (!self->conn && !reader_connect(self, true))
+        goto error;
+
+    if (verbose)
+        fprintf(stderr,
+                "%s: dropping replication slot \"%s\"\n",
+                self->progname, self->slot);
+
+    snprintf(query, sizeof(query), "DROP_REPLICATION_SLOT \"%s\"",
+            self->slot);
+    res = PQexec(self->conn, query);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK)
+    {
+        PyErr_Format(PyExc_ValueError,
+                "%s: could not send replication command \"%s\": %s",
+                self->progname, query, PQerrorMessage(self->conn));
+        goto error;
+    }
+
+    if (PQntuples(res) != 0 || PQnfields(res) != 0)
+    {
+        PyErr_Format(PyExc_ValueError,
+                "%s: could not drop replication slot \"%s\": got %d rows and %d fields, expected %d rows and %d fields\n",
+                self->progname, self->slot, PQntuples(res), PQnfields(res), 0, 0);
+        goto error;
+    }
+    PQclear(res);
+    return 1;
+error:
+    if(res)
+        PQclear(res);
+    return 0;
+}
+
+static PyObject *
+py_reader_drop_slot(readerObject *self)
+{
+    if(!reader_drop_slot(self))
+        return NULL;
+    Py_RETURN_NONE;
+}
+
+
+
 static struct PyMethodDef reader_methods[] = {
     {"start", (PyCFunction)reader_start, METH_NOARGS,
     reader_start_doc},
@@ -850,6 +908,8 @@ static struct PyMethodDef reader_methods[] = {
     reader_stop_doc},
     {"commit", (PyCFunction)py_reader_commit, METH_NOARGS,
     reader_commit_doc},
+    {"drop_slot", (PyCFunction)py_reader_drop_slot, METH_NOARGS,
+    reader_drop_slot_doc},
     {NULL}
 };
 
