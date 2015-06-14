@@ -3,8 +3,8 @@
 #include "connection.h"
 #include "streamutils.h"
 
-#define reader_start_doc \
-"start() -> start the main loop"
+#define reader_stream_doc \
+"stream() -> start the main loop"
 
 #define reader_stop_doc \
 "stop() -> stop the main loop"
@@ -572,7 +572,7 @@ reader_sendFeedback(readerObject *self, int64_t now, bool force, bool replyReque
  * listen on connection, call user's callbacks and send feedback to origin
  * */
 int
-reader_start(readerObject *self)
+reader_stream(readerObject *self)
 {
     PGresult    *res = NULL;
     char        *copybuf = NULL;
@@ -910,9 +910,9 @@ reader_dealloc(PyObject* obj)
 }
 
 static PyObject *
-py_reader_start(readerObject *self)
+py_reader_stream(readerObject *self)
 {
-    if(!reader_start(self))
+    if(!reader_stream(self))
         return NULL;
     Py_RETURN_NONE;
 }
@@ -942,8 +942,8 @@ py_reader_drop_slot(readerObject *self)
 }
 
 static struct PyMethodDef reader_methods[] = {
-    {"start", (PyCFunction)py_reader_start, METH_NOARGS,
-    reader_start_doc},
+    {"stream", (PyCFunction)py_reader_stream, METH_NOARGS,
+    reader_stream_doc},
     {"stop", (PyCFunction)py_reader_stop, METH_NOARGS,
     reader_stop_doc},
     {"commit", (PyCFunction)py_reader_commit, METH_NOARGS,

@@ -18,4 +18,4 @@ class MyReader(Reader):
 
 if __name__ == '__main__':
     r = MyReader()
-    r.start()
+    r.stream()
