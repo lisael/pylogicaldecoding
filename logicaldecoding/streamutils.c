@@ -113,4 +113,19 @@ fe_sendint64(int64_t i, char *buf)
     memcpy(&buf[4], &n32, 4);
 }
 
+void
+pg_usleep(long microsec)
+{
+	if (microsec > 0)
+	{
+#ifndef WIN32
+		struct timeval delay;
 
+		delay.tv_sec = microsec / 1000000L;
+		delay.tv_usec = microsec % 1000000L;
+		(void) select(0, NULL, NULL, NULL, &delay);
+#else
+		SleepEx((microsec < 500 ? 1 : (microsec + 500) / 1000), FALSE);
+#endif
+	}
+}

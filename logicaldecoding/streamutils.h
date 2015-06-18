@@ -21,6 +21,7 @@
 
 typedef uint64_t XLogRecPtr;
 #define Max(x, y)       ((x) > (y) ? (x) : (y))
+#define Min(x, y)       ((x) < (y) ? (x) : (y))
 
 /*
  * Zero is used indicate an invalid pointer. Bootstrap skips the first possible
@@ -36,4 +37,5 @@ void feTimestampDifference(int64_t start_time, int64_t stop_time, long *secs, in
 bool feTimestampDifferenceExceeds(int64_t start_time, int64_t stop_time, int msec);
 int64_t fe_recvint64(char *buf);
 void fe_sendint64(int64_t i, char *buf);
+void pg_usleep(long microsec);
 

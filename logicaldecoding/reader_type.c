@@ -1,4 +1,5 @@
 #include <signal.h>
+#include <math.h>
 #include "logicaldecoding.h"
 #include "connection.h"
 #include "streamutils.h"
@@ -18,6 +19,8 @@
 #define reader_drop_slot_doc \
 "drop_slot() -> drop the replication slot"
 
+// 10s
+#define MAX_RETRY_INTERVAL 10000000
 
 static volatile sig_atomic_t global_abort = false;
 
@@ -42,6 +45,7 @@ typedef struct pghx_ld_reader{
     char        *slot;
     char        create_slot;
     int         standby_message_timeout; // feedback interval in ms
+    int64_t     connection_timeout; // retry time
     stream_cb_  stream_cb;
     void        *user_data;
 
@@ -83,7 +87,9 @@ reader_connect(pghx_ld_reader *r, bool replication)
     const char **keywords;
     const char **values;
     const char *tmpparam;
-    PGconn *tmp;
+    PGconn *tmp = NULL;
+    int atempts = 0;
+    int64_t start_time, end_time;
 
     /* load map */
     i = 0;
@@ -137,29 +143,44 @@ reader_connect(pghx_ld_reader *r, bool replication)
         i++;
     }
 
-    tmp = PQconnectdbParams(keywords, values, true);
-
-    if (!tmp)
+    start_time = feGetCurrentTimestamp();
+    end_time = start_time + r->connection_timeout;
+    while (!global_abort && !r->abort)
     {
-        PyErr_NoMemory();
-        goto error;
-    }
+        int64_t time_to_sleep;
 
-    if (PQstatus(tmp) == CONNECTION_BAD)
-    {
-        if (PQconnectionNeedsPassword(tmp))
+        tmp = PQconnectdbParams(keywords, values, true);
+
+        if (!tmp)
+        {
+            PyErr_NoMemory();
+            // no possible retry
+            goto error;
+        }
+
+        if (PQstatus(tmp) == CONNECTION_BAD && PQconnectionNeedsPassword(tmp))
         {
             PyErr_SetString(PyExc_ValueError, "password needed");
             goto error;
         }
-    }
 
-    if (PQstatus(tmp) != CONNECTION_OK)
-    {
-        PyErr_Format(PyExc_IOError,
-            "Could not connect to server: %s\n",
-             PQerrorMessage(tmp));
-        goto error;
+        if (PQstatus(tmp) == CONNECTION_OK )
+            break;
+
+        time_to_sleep = Min(MAX_RETRY_INTERVAL, 500000 * pow(2, atempts));
+        if (start_time + time_to_sleep > end_time)
+        {
+            PyErr_Format(PyExc_IOError,
+                "Could not connect to server: %s\n",
+                PQerrorMessage(tmp));
+            goto error;
+        }
+        if (verbose)
+            fprintf(stderr,
+                "cannot connect. Retry in %lims\n",
+                time_to_sleep/1000);
+        pg_usleep(time_to_sleep);
+        atempts ++;
     }
 
     /* Connection ok! */
@@ -204,9 +225,15 @@ error:
     if (tmp)
         PQfinish(tmp);
     if (r->conn)
+    {
         PQfinish(r->conn);
+        r->conn = NULL;
+    }
     if (r->regularConn)
+    {
         PQfinish(r->regularConn);
+        r->regularConn = NULL;
+    }
     return 0;
 }
 
@@ -336,6 +363,11 @@ reader_create_slot(pghx_ld_reader *r)
 error:
     if(res)
         PQclear(res);
+    if (r->conn)
+    {
+        PQfinish(r->conn);
+        r->conn = NULL;
+    }
     return 0;
 }
 
@@ -541,6 +573,11 @@ reader_drop_slot(pghx_ld_reader *r)
 error:
     if(res)
         PQclear(res);
+    if (r->conn)
+    {
+        PQfinish(r->conn);
+        r->conn = NULL;
+    }
     return 0;
 }
 
@@ -574,49 +611,37 @@ reader_sendFeedback(pghx_ld_reader *r, int64_t now, bool force, bool replyReques
     replybuf[len] = replyRequested ? 1 : 0;		/* replyRequested */
     len += 1;
     if (!r->conn && !reader_connect(r, true))
+    {
         // exception is setted in reader_connect...
         return 0;
+    }
+    // TODO: this doesn't seem to detect broken connection...
     if (PQputCopyData(r->conn, replybuf, len) <= 0
             || PQflush(r->conn))
     {
         PyErr_Format(PyExc_IOError,
                     "Could not send feedback packet: %s",
                     PQerrorMessage(r->conn));
+        if (r->conn)
+        {
+            PQfinish(r->conn);
+            r->conn = NULL;
+        }
         return 0;
     }
     return 1;
 }
 
-
-
-/* main loop
- * listen on connection, call user's callbacks and send feedback to origin
- * */
-int
-reader_stream(pghx_ld_reader *r)
+/* check that the slot exists and create the slot if needed */
+static int
+reader_prepare(pghx_ld_reader *r)
 {
-    PGresult    *res = NULL;
-    char        *copybuf = NULL;
-    int         i;
-    PQExpBuffer query;
+    slotStatus  *status = reader_slot_status(r);
 
-    char        **options=NULL;
-
-    int         noptions = 0;
-    slotStatus  *status = NULL;
-
-    static bool first_loop = true;
-
-    r->abort = false;
-    query = createPQExpBuffer();
-
-    /*
-     * check slot and create if it doesn't exist
-     */
-    status = reader_slot_status(r);
     // got an error
     if (!status)
         goto error;
+
     // no slot
     if(strlen(status->slot_name) == 0){
         // create the slot if requested
@@ -647,14 +672,26 @@ reader_stream(pghx_ld_reader *r)
             goto error;
         }
     }
+    free(status);
+    return 1;
+error:
+    if (status)
+        free(status);
+    return 0;
+}
 
+int
+reader_init_replication(pghx_ld_reader *r)
+{
+    PGresult    *res = NULL;
+    int         i;
+    PQExpBuffer query;
 
-    /*
-     * Connect in replication mode to the server
-     */
-    if (!r->conn && !reader_connect(r, true))
-        // exception is setted in reader_connect...
-        goto error;
+    // TODO: these should be pghx_ld_reader fields
+    char        **options=NULL;
+    int         noptions = 0;
+
+    query = createPQExpBuffer();
 
     /*
      * Start the replication
@@ -700,15 +737,25 @@ reader_stream(pghx_ld_reader *r)
         PyErr_Format(PyExc_ValueError,
                 "Could not send replication command \"%s\": %s",
                 query->data, error_msg);
-        goto error;
+        destroyPQExpBuffer(query);
+        return 0;
     }
 
-    resetPQExpBuffer(query);
+    destroyPQExpBuffer(query);
 
     if (verbose)
         fprintf(stderr,
                 "%s: streaming initiated\n",
                 r->progname);
+    return 1;
+}
+
+/* inner main loop */
+int
+reader_do_stream(pghx_ld_reader  *r)
+{
+    PGresult    *res = NULL;
+    char        *copybuf = NULL;
 
     while (!global_abort && !r->abort)
     {
@@ -726,9 +773,9 @@ reader_stream(pghx_ld_reader *r)
          */
         now = feGetCurrentTimestamp();
 
-        if (first_loop || (r->standby_message_timeout > 0 &&
+        if (r->standby_message_timeout > 0 &&
                 feTimestampDifferenceExceeds(r->last_status, now,
-                    r->standby_message_timeout)))
+                    r->standby_message_timeout))
         {
             /* Time to send feedback! */
             if (!reader_sendFeedback(r, now, true, false))
@@ -738,7 +785,6 @@ reader_stream(pghx_ld_reader *r)
 
             r->last_status = now;
         }
-        first_loop=false;
 
         buf_len = PQgetCopyData(r->conn, &copybuf, 1);
         if (buf_len == 0)
@@ -830,7 +876,6 @@ reader_stream(pghx_ld_reader *r)
         goto error;
     }
     PQclear(res);
-    destroyPQExpBuffer(query);
     PQfinish(r->conn);
     r->conn = NULL;
     return 1;
@@ -843,11 +888,54 @@ error:
     }
     if (res)
         PQclear(res);
-    destroyPQExpBuffer(query);
     PQfinish(r->conn);
     r->conn = NULL;
     return 0;
 }
+
+/* main loop
+ * listen on connection, call user's callbacks and send feedback to origin
+ * */
+int
+reader_stream(pghx_ld_reader *r)
+{
+
+    if (!reader_prepare(r))
+        return 0;
+
+    r->abort = false;
+
+    while (!global_abort && !r->abort)
+    {
+        int64_t     now;
+
+        if (!r->conn && !reader_connect(r, true))
+            return 0;
+
+        if (!reader_init_replication(r))
+            // TODO: implement retry
+            return 0;
+
+        now = feGetCurrentTimestamp();
+        if (!reader_sendFeedback(r, now, true, false))
+        {
+            return 0;
+        }
+
+        if (!reader_do_stream(r))
+        {
+            if (r->conn)
+            {
+                PQfinish(r->conn);
+                r->conn = NULL;
+            }
+            continue;
+        }
+    }
+    // TODO: cleanup, dorp slot if the user said so
+    return 1;
+}
+
 
 int
 reader_stop(pghx_ld_reader *r)
@@ -859,6 +947,7 @@ reader_stop(pghx_ld_reader *r)
 int
 pghx_ld_reader_init(pghx_ld_reader *r)
 {
+    signal(SIGINT, sigint_handler);
     r->host = r->port = r->username = r->password = NULL;
     r->dbname = "postgres";
     r->progname = "pylogicaldecoding";
@@ -867,6 +956,7 @@ pghx_ld_reader_init(pghx_ld_reader *r)
     r->create_slot = 1;
     r->startpos = InvalidXLogRecPtr;
     r->standby_message_timeout = 10 * 1000;
+    r->connection_timeout = 60 * 1000 * 1000; // 1 minute
     r->decoded_lsn = InvalidXLogRecPtr;
     r->last_status = -1;
     r->stream_cb = NULL;
@@ -884,20 +974,17 @@ reader_init(PyObject *obj, PyObject *args, PyObject *kwargs)
 
     static char *kwlist[] = {
         "host", "port", "username", "dbname", "password",
-        "progname", "plugin", "slot", "create_slot", "feedback_interval", NULL};
+        "progname", "plugin", "slot", "create_slot", "feedback_interval",
+        "connection_timeout", NULL};
 
     pghx_ld_reader_init(r);
 
-    // TODO: not sure where we should register the signal
-    // maybe we should expose a function here called at module init.
-    signal(SIGINT, sigint_handler);
-
     if (!PyArg_ParseTupleAndKeywords(
-            args, kwargs, "|ssssssssbi", kwlist,
+            args, kwargs, "|ssssssssbil", kwlist,
             &(r->host), &(r->port), &(r->username),
             &(r->dbname), &(r->password), &(r->progname),
             &(r->plugin), &(r->slot), &(r->create_slot),
-            &(r->standby_message_timeout)))
+            &(r->standby_message_timeout),&(r->connection_timeout)))
         return -1;
 
     // test a connection
