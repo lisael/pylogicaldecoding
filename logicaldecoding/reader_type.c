@@ -26,6 +26,24 @@ static volatile sig_atomic_t global_abort = false;
 
 bool verbose = true;
 
+typedef enum pghx_error_type{
+    PGHX_NO_ERROR,
+    PGHX_CONNECTION_ERROR,
+} pghx_error_type;
+
+pghx_error_type pghx_error = PGHX_NO_ERROR;
+char pghx_error_info[1024];
+
+#define Pghx_set_error(tp, info) do{\
+    pghx_error = (tp);\
+    strcpy(pghx_error_info, info);\
+}while(0)
+
+#define Pghx_format_error(tp, info,...) do{\
+    pghx_error = (tp);\
+    snprintf(pghx_error_info, 1024, (info), __VA_ARGS__);\
+}while(0)
+
 typedef struct slotStatus{
     char *slot_name;
     char *plugin;
@@ -143,6 +161,7 @@ reader_connect(pghx_ld_reader *r, bool replication)
         i++;
     }
 
+
     start_time = feGetCurrentTimestamp();
     end_time = start_time + r->connection_timeout;
     while (!global_abort && !r->abort)
@@ -194,8 +213,8 @@ reader_connect(pghx_ld_reader *r, bool replication)
     tmpparam = PQparameterStatus(tmp, "integer_datetimes");
     if (!tmpparam)
     {
-        PyErr_SetString(PyExc_ValueError,
-                "Could not determine server setting for integer_datetimes");
+        Pghx_set_error(PGHX_CONNECTION_ERROR,
+                "Could not determine server setting for ii integer_datetimes");
         goto error;
     }
 
@@ -966,6 +985,21 @@ pghx_ld_reader_init(pghx_ld_reader *r)
 
 /* PYTHON STUFF */
 
+
+static void
+py_set_pghx_error(void){
+    static PyObject *PyErr_to_pghx_error_type[3] = {
+        NULL,
+        NULL,
+    };
+    if (!PyErr_to_pghx_error_type[1])
+    {
+        PyErr_to_pghx_error_type[1] = PyExc_ValueError;
+        PyErr_to_pghx_error_type[2] = PyExc_IOError;
+    }
+    PyErr_SetString(PyErr_to_pghx_error_type[(int)pghx_error], pghx_error_info);
+}
+
 static int
 reader_init(PyObject *obj, PyObject *args, PyObject *kwargs)
 {
@@ -1037,7 +1071,10 @@ static PyObject *
 py_reader_stream(PyLDReader *self)
 {
     if(!reader_stream(&(self->reader)))
+    {
+        py_set_pghx_error();
         return NULL;
+    }
     Py_RETURN_NONE;
 }
 
@@ -1045,7 +1082,10 @@ static PyObject *
 py_reader_stop(PyLDReader *self)
 {
     if(!reader_stop(&(self->reader)))
+    {
+        py_set_pghx_error();
         return NULL;
+    }
     Py_RETURN_NONE;
 }
 
@@ -1053,7 +1093,10 @@ static PyObject *
 py_reader_commit(PyLDReader *self)
 {
     if(!reader_commit(&(self->reader)))
+    {
+        py_set_pghx_error();
         return NULL;
+    }
     Py_RETURN_NONE;
 }
 
@@ -1061,7 +1104,10 @@ static PyObject *
 py_reader_drop_slot(PyLDReader *self)
 {
     if(!reader_drop_slot(&(self->reader)))
+    {
+        py_set_pghx_error();
         return NULL;
+    }
     Py_RETURN_NONE;
 }
 
