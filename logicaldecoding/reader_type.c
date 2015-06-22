@@ -28,7 +28,27 @@ bool verbose = true;
 
 typedef enum pghx_error_type{
     PGHX_NO_ERROR,
+
+    // system errors
+    PGHX_IO_ERROR,
+    PGHX_OUT_OF_MEMORY,
+
+    // generic DB errors
     PGHX_CONNECTION_ERROR,
+    PGHX_PASSWORD_ERROR,
+    PGHX_COMMAND_ERROR,
+    PGHX_QUERY_ERROR,
+
+    // logical decoding specific errors
+    PGHX_LD_STREAM_PROTOCOL_ERROR,
+    PGHX_LD_REPLICATION_ERROR,
+    PGHX_LD_NO_SLOT,
+    PGHX_LD_BAD_PLUGIN,
+    PGHX_LD_STATUS_ERROR,
+
+    // you'll need this to create a mapping with your errors/ecxeptions
+    // (I love that trick, though I can't remember where I read that first)
+    PGHX_ERRORS_NUM,
 } pghx_error_type;
 
 pghx_error_type pghx_error = PGHX_NO_ERROR;
@@ -172,14 +192,14 @@ reader_connect(pghx_ld_reader *r, bool replication)
 
         if (!tmp)
         {
-            PyErr_NoMemory();
+            Pghx_set_error(PGHX_OUT_OF_MEMORY, "Could not create connection\n");
             // no possible retry
             goto error;
         }
 
         if (PQstatus(tmp) == CONNECTION_BAD && PQconnectionNeedsPassword(tmp))
         {
-            PyErr_SetString(PyExc_ValueError, "password needed");
+            Pghx_set_error(PGHX_PASSWORD_ERROR, "password needed");
             goto error;
         }
 
@@ -187,9 +207,10 @@ reader_connect(pghx_ld_reader *r, bool replication)
             break;
 
         time_to_sleep = Min(MAX_RETRY_INTERVAL, 500000 * pow(2, atempts));
-        if (start_time + time_to_sleep > end_time)
+        /*if (start_time + time_to_sleep > end_time)*/
+        if (42)
         {
-            PyErr_Format(PyExc_IOError,
+            Pghx_format_error(PGHX_CONNECTION_ERROR,
                 "Could not connect to server: %s\n",
                 PQerrorMessage(tmp));
             goto error;
@@ -214,7 +235,7 @@ reader_connect(pghx_ld_reader *r, bool replication)
     if (!tmpparam)
     {
         Pghx_set_error(PGHX_CONNECTION_ERROR,
-                "Could not determine server setting for ii integer_datetimes");
+                "Could not determine server setting for integer_datetimes");
         goto error;
     }
 
@@ -225,7 +246,7 @@ reader_connect(pghx_ld_reader *r, bool replication)
 //        if (strcmp(tmpparam, "off") != 0)
 //#endif
         {
-            PyErr_SetString(PyExc_ValueError,
+            Pghx_set_error(PGHX_CONNECTION_ERROR,
                     "Integer_datetimes compile flag does not match server");
             goto error;
         }
@@ -282,7 +303,7 @@ reader_slot_status(pghx_ld_reader *r)
     if (PQresultStatus(res) != PGRES_TUPLES_OK)
     {
         char *err_code = PQresultErrorField(res,PG_DIAG_SQLSTATE);
-        PyErr_Format(PyExc_ValueError,
+        Pghx_format_error(PGHX_QUERY_ERROR,
                 "%s: could not send status command \"%s\": %s\n%s",
                 r->progname, query, PQerrorMessage(r->regularConn), err_code);
         goto error;
@@ -291,7 +312,7 @@ reader_slot_status(pghx_ld_reader *r)
     if (PQntuples(res) > 1 || PQnfields(res) != 9)
     {
         /*char *err_code = PQresultErrorField(res, PG_DIAG_SQLSTATE);*/
-        PyErr_Format(PyExc_ValueError,
+        Pghx_format_error(PGHX_LD_STATUS_ERROR,
                 "%s: wrong status field number \"%s\": got %d rows and %d fields, expected %d rows and %d fields\n",
                 r->progname, r->slot, PQntuples(res), PQnfields(res), 1, 9);
         goto error;
@@ -348,7 +369,7 @@ reader_create_slot(pghx_ld_reader *r)
     if (PQresultStatus(res) != PGRES_TUPLES_OK)
     {
         char *err_code = PQresultErrorField(res, PG_DIAG_SQLSTATE);
-        PyErr_Format(PyExc_ValueError,
+        Pghx_format_error(PGHX_LD_REPLICATION_ERROR,
                 "%s: could not send replication command \"%s\": %s %s\n",
                 r->progname, query, PQerrorMessage(r->conn), err_code);
         goto error;
@@ -357,7 +378,7 @@ reader_create_slot(pghx_ld_reader *r)
     if (PQntuples(res) != 1 || PQnfields(res) != 4)
     {
         char *err_code = PQresultErrorField(res, PG_DIAG_SQLSTATE);
-        PyErr_Format(PyExc_ValueError,
+        Pghx_format_error(PGHX_LD_REPLICATION_ERROR,
                 "%s: could not create replication slot \"%s\": got %d rows and %d fields, expected %d rows and %d fields\n%s\n",
                 r->progname, r->slot, PQntuples(res), PQnfields(res), 1, 4, err_code);
         goto error;
@@ -366,7 +387,7 @@ reader_create_slot(pghx_ld_reader *r)
     if (sscanf(PQgetvalue(res, 0, 1), "%X/%X", &hi, &lo) != 2)
     {
         char *err_code = PQresultErrorField(res, PG_DIAG_SQLSTATE);
-        PyErr_Format(PyExc_ValueError,
+        Pghx_format_error(PGHX_LD_STREAM_PROTOCOL_ERROR,
                 "%s: could not parse transaction log location \"%s\"\n%s\n",
                 r->progname, PQgetvalue(res, 0, 1), err_code);
         goto error;
@@ -443,7 +464,7 @@ reader_reply_keepalive(pghx_ld_reader *r, char *copybuf, int buf_len)
 
     if (buf_len < pos + 1)
     {
-        PyErr_Format(PyExc_ValueError,
+        Pghx_format_error(PGHX_LD_STREAM_PROTOCOL_ERROR,
                 "Streaming header too small: %d\n",
                 buf_len);
         return 0;
@@ -513,7 +534,7 @@ reader_consume_stream(pghx_ld_reader *r, char *copybuf, int buf_len)
     hdr_len += 8;			/* sendTime */
     if (buf_len < hdr_len + 1)
     {
-        PyErr_Format(PyExc_ValueError,
+        Pghx_format_error(PGHX_LD_STREAM_PROTOCOL_ERROR,
                 "Streaming header too small: %d\n",
                 buf_len);
         return 0;
@@ -574,7 +595,7 @@ reader_drop_slot(pghx_ld_reader *r)
     res = PQexec(r->conn, query);
     if (PQresultStatus(res) != PGRES_COMMAND_OK)
     {
-        PyErr_Format(PyExc_ValueError,
+        Pghx_format_error(PGHX_COMMAND_ERROR,
                 "%s: could not send replication command \"%s\": %s",
                 r->progname, query, PQerrorMessage(r->conn));
         goto error;
@@ -582,7 +603,7 @@ reader_drop_slot(pghx_ld_reader *r)
 
     if (PQntuples(res) != 0 || PQnfields(res) != 0)
     {
-        PyErr_Format(PyExc_ValueError,
+        Pghx_format_error(PGHX_COMMAND_ERROR,
                 "%s: could not drop replication slot \"%s\": got %d rows and %d fields, expected %d rows and %d fields\n",
                 r->progname, r->slot, PQntuples(res), PQnfields(res), 0, 0);
         goto error;
@@ -638,7 +659,7 @@ reader_sendFeedback(pghx_ld_reader *r, int64_t now, bool force, bool replyReques
     if (PQputCopyData(r->conn, replybuf, len) <= 0
             || PQflush(r->conn))
     {
-        PyErr_Format(PyExc_IOError,
+        Pghx_format_error(PGHX_CONNECTION_ERROR,
                     "Could not send feedback packet: %s",
                     PQerrorMessage(r->conn));
         if (r->conn)
@@ -674,7 +695,7 @@ reader_prepare(pghx_ld_reader *r)
         }
         else
         {
-            PyErr_Format(PyExc_ValueError,
+            Pghx_format_error(PGHX_LD_NO_SLOT,
                     "Slot \"%s\" does not exist",
                     r->slot);
             goto error;
@@ -685,7 +706,7 @@ reader_prepare(pghx_ld_reader *r)
         // check plugin name
         if (strcmp(r->plugin, status->plugin))
         {
-            PyErr_Format(PyExc_ValueError,
+            Pghx_format_error(PGHX_LD_BAD_PLUGIN,
                     "Slot \"%s\" uses pluguin \"%s\". You required \"%s\"",
                     r->slot, status->plugin, r->plugin);
             goto error;
@@ -753,7 +774,7 @@ reader_init_replication(pghx_ld_reader *r)
     if (PQresultStatus(res) != PGRES_COPY_BOTH)
     {
         char *error_msg = PQresultErrorMessage(res);
-        PyErr_Format(PyExc_ValueError,
+        Pghx_format_error(PGHX_COMMAND_ERROR,
                 "Could not send replication command \"%s\": %s",
                 query->data, error_msg);
         destroyPQExpBuffer(query);
@@ -834,7 +855,7 @@ reader_do_stream(pghx_ld_reader  *r)
             }
             else if (buf_len < 0)
             {
-                PyErr_Format(PyExc_ValueError,
+                Pghx_format_error(PGHX_IO_ERROR,
                         "select() failed: %s\n",
                         strerror(errno));
                 goto error;
@@ -843,7 +864,7 @@ reader_do_stream(pghx_ld_reader  *r)
             /* Else there is actually data on the socket */
             if (PQconsumeInput(r->conn) == 0)
             {
-                PyErr_Format(PyExc_ValueError,
+                Pghx_format_error(PGHX_IO_ERROR,
                         "Could not receive data from WAL stream:\t%s",
                         PQerrorMessage(r->conn));
                 goto error;
@@ -860,7 +881,7 @@ reader_do_stream(pghx_ld_reader  *r)
         /* Failure while reading the copy stream */
         if (buf_len == -2)
         {
-            PyErr_Format(PyExc_ValueError,
+            Pghx_format_error(PGHX_IO_ERROR,
                     "Could not read COPY data: %s",
                     PQerrorMessage(r->conn));
             goto error;
@@ -876,7 +897,7 @@ reader_do_stream(pghx_ld_reader  *r)
         }
         else if (copybuf[0] != 'w')
         {
-            PyErr_Format(PyExc_ValueError,
+            Pghx_format_error(PGHX_LD_STREAM_PROTOCOL_ERROR,
                     "Unrecognized streaming header: \"%c\"\n",
                     copybuf[0]);
             goto error;
@@ -889,7 +910,7 @@ reader_do_stream(pghx_ld_reader  *r)
     res = PQgetResult(r->conn);
     if (PQresultStatus(res) != PGRES_COMMAND_OK)
     {
-        PyErr_Format(PyExc_ValueError,
+        Pghx_format_error(PGHX_IO_ERROR,
                 "unexpected termination of replication stream: %s",
                 PQresultErrorMessage(res));
         goto error;
@@ -988,16 +1009,54 @@ pghx_ld_reader_init(pghx_ld_reader *r)
 
 static void
 py_set_pghx_error(void){
-    static PyObject *PyErr_to_pghx_error_type[3] = {
-        NULL,
-        NULL,
-    };
-    if (!PyErr_to_pghx_error_type[1])
+    PyObject *exception;
+    static PyObject *error_map[PGHX_ERRORS_NUM] = { NULL };
+    // early return in case of OOM (it soon gonna crash anyway,
+    // let's try to write the cause)
+    if (pghx_error == PGHX_OUT_OF_MEMORY)
     {
-        PyErr_to_pghx_error_type[1] = PyExc_ValueError;
-        PyErr_to_pghx_error_type[2] = PyExc_IOError;
+        fprintf(stderr, "%s\n", pghx_error_info);
+        fflush(stderr);
+        PyErr_NoMemory();
+        return;
     }
-    PyErr_SetString(PyErr_to_pghx_error_type[(int)pghx_error], pghx_error_info);
+    // this is bad, maybe we should raise something ugly or exit.
+    if (pghx_error == PGHX_NO_ERROR)
+    {
+        fputs("py_set_pghx_error() called without error\n", stderr);
+        fflush(stderr);
+        return;
+    }
+
+    // initialize the error map
+    // TODO: use or create sensible exceptions
+    if (!error_map[1])
+    {
+        error_map[PGHX_IO_ERROR] = PyExc_ValueError;
+        error_map[PGHX_OUT_OF_MEMORY] = PyExc_ValueError;
+
+        // generic DB errors
+        error_map[PGHX_CONNECTION_ERROR] = PyExc_ValueError;
+        error_map[PGHX_PASSWORD_ERROR] = PyExc_ValueError;
+        error_map[PGHX_COMMAND_ERROR] = PyExc_ValueError;
+        error_map[PGHX_QUERY_ERROR] = PyExc_ValueError;
+
+        // logical decoding specific errors
+        error_map[PGHX_LD_STREAM_PROTOCOL_ERROR] = PyExc_ValueError;
+        error_map[PGHX_LD_REPLICATION_ERROR] = PyExc_ValueError;
+        error_map[PGHX_LD_NO_SLOT] = PyExc_ValueError;
+        error_map[PGHX_LD_BAD_PLUGIN] = PyExc_ValueError;
+        error_map[PGHX_LD_STATUS_ERROR] = PyExc_ValueError;
+    }
+    exception = error_map[pghx_error];
+    // probably something new in pghx, we don't handle yet
+    if (!exception){
+        PyErr_Format(PyExc_Exception, "Unknown error: %s", pghx_error_info);
+    }
+    else
+    {
+        PyErr_SetString(error_map[(int)pghx_error], pghx_error_info);
+    }
 }
 
 static int
