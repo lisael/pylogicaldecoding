@@ -128,6 +128,7 @@ reader_connect(pghx_ld_reader *r, bool replication)
     PGconn *tmp = NULL;
     int atempts = 0;
     int64_t start_time, end_time;
+    int64_t slept = 0;
 
     /* load map */
     i = 0;
@@ -197,6 +198,8 @@ reader_connect(pghx_ld_reader *r, bool replication)
             goto error;
         }
 
+        // TODO: perform some other checks to avoid retries on
+        // not recoverable errors (e.g pg_hba misconfiguration)
         if (PQstatus(tmp) == CONNECTION_BAD && PQconnectionNeedsPassword(tmp))
         {
             Pghx_set_error(PGHX_PASSWORD_ERROR, "password needed");
@@ -207,8 +210,8 @@ reader_connect(pghx_ld_reader *r, bool replication)
             break;
 
         time_to_sleep = Min(MAX_RETRY_INTERVAL, 500000 * pow(2, atempts));
-        /*if (start_time + time_to_sleep > end_time)*/
-        if (42)
+        time_to_sleep = Min(end_time - start_time - slept + 1, time_to_sleep );
+        if (start_time + slept > end_time)
         {
             Pghx_format_error(PGHX_CONNECTION_ERROR,
                 "Could not connect to server: %s\n",
@@ -217,9 +220,10 @@ reader_connect(pghx_ld_reader *r, bool replication)
         }
         if (verbose)
             fprintf(stderr,
-                "cannot connect. Retry in %lims\n",
-                time_to_sleep/1000);
+                    "cannot connect: %s\nRetry in %lims\n",
+                    PQerrorMessage(tmp), time_to_sleep/1000);
         pg_usleep(time_to_sleep);
+        slept = slept + time_to_sleep;
         atempts ++;
     }
 
