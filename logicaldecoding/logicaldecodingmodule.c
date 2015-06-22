@@ -1,6 +1,6 @@
 
 #define PSYCOPG_MODULE
-#include "logicaldecoding/logicaldecoding.h"
+#include "logicaldecoding/pylogicaldecoding.h"
 
 extern HIDDEN PyTypeObject readerType;
 

@@ -406,18 +406,28 @@ data_files = []
 
 # sources
 
+pghx_sources = [
+    "utils.c",
+    "logicaldecoding.c",
+    "errors.c",
+]
+
+pghx_depends = [
+    "utils.h",
+    "errors.h",
+    "logicaldecoding.h",
+]
+
 sources = [
-    'logicaldecodingmodule.c', "connection.c",
-
+    'logicaldecodingmodule.c',
+    "connection.c",
     'reader_type.c',
-    'streamutils.c',
-
 ]
 
 depends = [
-    # headers
-    "python.h", "logicaldecoding.h", "connection.h", "streamutils.h",
-    # included sources
+    "python.h",
+    "connection.h",
+    "pylogicaldecoding.h",
 ]
 
 parser = configparser.ConfigParser()
@@ -470,7 +480,7 @@ if version_flags:
 else:
     PYLD_VERSION_EX = PYLD_VERSION
 
-define_macros.append(('PYLD_VERSION', '\\"' + PYLD_VERSION_EX + '\\"'))
+#define_macros.append(('PYLD_VERSION', '\\"' + PYLD_VERSION_EX + '\\"'))
 
 if parser.has_option('build_ext', 'have_ssl'):
     have_ssl = int(parser.get('build_ext', 'have_ssl'))
@@ -493,7 +503,9 @@ for define in parser.get('build_ext', 'define').split(','):
 # build the extension
 
 sources = [ os.path.join('logicaldecoding', x) for x in sources]
+sources+= [os.path.join('pghx', x) for x in pghx_sources]
 depends = [ os.path.join('logicaldecoding', x) for x in depends]
+depends+= [os.path.join('pghx', x) for x in pghx_depends]
 
 ext.append(Extension("logicaldecoding._logicaldecoding", sources,
                      define_macros=define_macros,
