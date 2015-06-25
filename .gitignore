@@ -1,7 +1,5 @@
-configure
 ar-lib
-*.in
-config.h*
+config.h
 config.sub
 *.a
 *.lo
