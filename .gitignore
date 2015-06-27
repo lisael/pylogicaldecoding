@@ -1,16 +1,3 @@
-ar-lib
-config.h
-config.sub
-*.a
-*.lo
-*.o
-*.la
-stamp-h*
-src/Makefile
-src/pghx/Makefile
-tests/Makefile
-Makefile
-
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
