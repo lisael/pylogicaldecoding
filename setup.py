@@ -406,18 +406,6 @@ data_files = []
 
 # sources
 
-pghx_sources = [
-    "utils.c",
-    "logicaldecoding.c",
-    "errors.c",
-]
-
-pghx_depends = [
-    "utils.h",
-    "errors.h",
-    "logicaldecoding.h",
-]
-
 sources = [
     'logicaldecodingmodule.c',
     "connection.c",
@@ -503,12 +491,11 @@ for define in parser.get('build_ext', 'define').split(','):
 # build the extension
 
 sources = [ os.path.join('logicaldecoding', x) for x in sources]
-sources+= [os.path.join('pghx', x) for x in pghx_sources]
 depends = [ os.path.join('logicaldecoding', x) for x in depends]
-depends+= [os.path.join('pghx', x) for x in pghx_depends]
 
 ext.append(Extension("logicaldecoding._logicaldecoding", sources,
                      define_macros=define_macros,
+                     libraries=['pghx'],
                      include_dirs=include_dirs,
                      depends=depends,
                      undef_macros=[]))

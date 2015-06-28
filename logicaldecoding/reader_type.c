@@ -1,8 +1,8 @@
 #include <signal.h>
 #include <math.h>
 #include "pylogicaldecoding.h"
-#include "../pghx/logicaldecoding.h"
-#include "../pghx/errors.h"
+#include <pghx/logicaldecoding.h>
+#include <pghx/errors.h>
 
 #define reader_stream_doc \
 "stream() -> start the main loop"

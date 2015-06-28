@@ -10,6 +10,10 @@ of these distribs, and many more UNIXes-like systems).
 
 Please use pg provided packages (TODO: URL)
 
+# PGHacks
+
+Install following [INSTALL instructions](https://github.com/lisael/PGHacks/blob/master/INSTALL.md#from-source-tarball-recommended)
+
 # pylogicaldecoding
 
 Clone the repository and create and new Python2.7 virtualenv.
