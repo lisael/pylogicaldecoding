@@ -11,9 +11,9 @@
 "stop() -> stop the main loop"
 
 #define reader_acknowledge_doc \
-"commit() -> send feedback message acknowledging all preceding stream\n"\
-"It's user's responsability to send regular acknowledgemnts. If"\
-"ommited, the master keeps all it's WAL on disk and eventually"\
+"ack() -> send feedback message acknowledging all preceding stream\n"\
+"It's user's responsibility to send regular acknowledgements. If"\
+"omited, the master keeps all its WAL on disk and eventually"\
 "Cthulhu eats the physical server"
 
 #define reader_drop_slot_doc \
@@ -101,6 +101,7 @@ py_set_pghx_error(void){
         error_map[PGHX_LD_NO_SLOT] = PyExc_ValueError;
         error_map[PGHX_LD_BAD_PLUGIN] = PyExc_ValueError;
         error_map[PGHX_LD_STATUS_ERROR] = PyExc_ValueError;
+        error_map[PGHX_LD_PARSE_ERROR] = PyExc_ValueError;
     }
     exception = error_map[pghx_error];
     // probably something new in pghx, we don't handle yet
@@ -134,9 +135,9 @@ reader_init(PyObject *obj, PyObject *args, PyObject *kwargs)
             &(r->standby_message_timeout),&(r->connection_timeout)))
         return -1;
 
-    // test a connection
     r->stream_cb = reader_stream_cb;
     r->user_data = (void *)self;
+    // test a connection
     return pghx_ld_reader_connect(r, true);
 }
 
@@ -229,7 +230,7 @@ static struct PyMethodDef reader_methods[] = {
     reader_stream_doc},
     {"stop", (PyCFunction)py_reader_stop, METH_NOARGS,
     reader_stop_doc},
-    {"commit", (PyCFunction)py_reader_acknowledge, METH_NOARGS,
+    {"ack", (PyCFunction)py_reader_acknowledge, METH_NOARGS,
     reader_acknowledge_doc},
     {"drop_slot", (PyCFunction)py_reader_drop_slot, METH_NOARGS,
     reader_drop_slot_doc},

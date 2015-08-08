@@ -12,7 +12,7 @@ Please use pg provided packages (TODO: URL)
 
 # PGHacks
 
-Install following [INSTALL instructions](https://github.com/lisael/PGHacks/blob/master/INSTALL.md#from-source-tarball-recommended)
+Install PGHacks following [INSTALL instructions](https://github.com/lisael/PGHacks/blob/master/INSTALL.md#from-source-tarball-recommended)
 
 # pylogicaldecoding
 

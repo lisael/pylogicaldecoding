@@ -6,8 +6,8 @@ http://www.postgresql.org/docs/9.4/static/logicaldecoding.html)
 
 # Quick start
 
-I suppose you managed to install dependences, pylogical decoding,
-and create a replication slot (read INSTALL.md).
+I suppose you managed to install build dependences, PGHacks, and
+pylogicaldecoding (read INSTALL.md).
 
 Open a postgres shell
 
@@ -135,12 +135,12 @@ will never miss an event. In `example/connection.py` you can read
         if value.startswith("COMMIT"):
             self.commits += 1
             if self.commits % 5 == 0:
-                self.commit()
+                self.ack()
 ```
 
-every 5 DB COMMIT we call `Reader.commit()` which acknowledges the
+every 5 DB COMMIT we call `Reader.ack()` which acknowledges the
 DB. The database is now free to drop the acknowledged log line. If we
-had not call `commit()` (ctl-C before 5 postgres commands), the server
+had not call `ack()` (ctl-C before 5 postgres commands), the server
 would keep these logs and re-send them when the consumer restart:
 
 terminal 1:
@@ -213,7 +213,7 @@ no way to re-read missed events.
 
 Once again, be careful, it's the killer feature but it can bite you. As soon
 as the slot is created, the origin DB keep all unacknowledged WAL on disk.
-If your consumer is dead, stuck or if you forget to call `commit()` you run into
+If your consumer is dead, stuck or if you forget to call `ack()` you run into
 big troubles.
 
 # Play, fork, hack, PR, and have fun

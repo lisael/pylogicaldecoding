@@ -13,7 +13,7 @@ class MyReader(Reader):
         if value.startswith("COMMIT"):
             self.commits += 1
             if self.commits % 5 == 0:
-                self.commit()
+                self.ack()
 
 
 if __name__ == '__main__':
